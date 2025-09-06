@@ -33,6 +33,9 @@ from torchtitan.tools.profiling import (
     maybe_enable_profiling,
 )
 
+from torchtitan.experiments.transformers_backend.model.hf_transformers_args import HFTransformerModelArgs
+from transformers.models.llama.modeling_llama import LlamaForCausalLM
+
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     # core configs
@@ -155,7 +158,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
         )
         with torch.device("meta"):
-            model = self.train_spec.model_cls(model_args)
+            if isinstance(model_args, HFTransformerModelArgs):
+                model = self.train_spec.model_cls(model_args.convert_to_hf_config())
+            else:
+                model = self.train_spec.model_cls(model_args)
 
         # Build the collection of model converters. No-op if `model.converters` empty
         model_converters = build_model_converters(job_config, parallel_dims)
@@ -261,7 +267,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             model.to_empty(device=init_device)
             with torch.no_grad():
-                model.init_weights(buffer_device=buffer_device)
+                if isinstance(model, LlamaForCausalLM):
+                    model.post_init()
+                else:
+                    model.init_weights(buffer_device=buffer_device)
             model.train()
 
             self.model_parts = [model]
