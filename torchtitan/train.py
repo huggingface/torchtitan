@@ -8,6 +8,7 @@ import importlib
 import os
 import time
 from datetime import timedelta
+from transformers.utils import is_torch_deterministic
 from typing import Any, Generator, Iterable, Optional
 
 import torch
@@ -32,6 +33,35 @@ from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
 )
+
+from transformers.models.llama.modeling_llama import LlamaForCausalLM, CausalLMOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
+
+
+# NOTE(3outeille): monkey-patch PreTrainedModel to handle meta device initialization correctly
+# The default _initialize_weights sets _is_hf_initialized = True even on a meta device,
+# which prevents subsequent proper initialization.
+def _initialize_weights_patched(self, module):
+    """
+    Patched version of _initialize_weights that skips initialization and setting
+    the _is_hf_initialized flag if the module is on a meta device.
+    """
+    if getattr(module, "_is_hf_initialized", False):
+        return
+
+    # Check if any parameter is on the meta device
+    for param in module.parameters(recurse=False):
+        if param.device.type == "meta":
+            return
+    
+    #TODO(3outeille): check if register bufffer is init 
+
+    # If not on a meta device, call the original weight initialization
+    self._init_weights(module)
+    module._is_hf_initialized = True
+
+
+PreTrainedModel._initialize_weights = _initialize_weights_patched
 
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
@@ -258,10 +288,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
             model = self.train_spec.parallelize_fn(model, parallel_dims, job_config)
-
+            if is_torch_deterministic():
+                # Otherwise, HF register buffer for ROPE (inv_freq) and this will be by default be initialized to Nan
+                torch.utils.deterministic.fill_uninitialized_memory = False
             model.to_empty(device=init_device)
             with torch.no_grad():
-                model.init_weights(buffer_device=buffer_device)
+                if isinstance(model, LlamaForCausalLM):
+                    model.post_init()
+                else:
+                    model.init_weights(buffer_device=buffer_device)
             model.train()
 
             self.model_parts = [model]
@@ -459,6 +494,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
                     pred = model_parts[0](inputs)
+                    #NOTE(3outeille): just trying to make it work for now. Will refactor later.
+                    if isinstance(pred, CausalLMOutputWithPast):
+                        pred = pred.logits
                     loss = self.loss_fn(pred, labels)
                 # need to free to before bwd to avoid peaking memory
                 del pred
