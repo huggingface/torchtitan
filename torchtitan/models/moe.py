@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from torchtitan.distributed.expert_parallel import expert_parallel
-
+import os
+from torchtitan.utils.test_utils import seeded_init_decorator_for_test
 
 @dataclass
 class MoEArgs:
@@ -57,6 +58,7 @@ class FeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
+    @seeded_init_decorator_for_test(seed=os.environ.get("SEED"))
     def init_weights(self, init_std: float = 0.02):
         nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
         for linear in (self.w2, self.w3):
@@ -153,6 +155,7 @@ class GroupedExperts(nn.Module):
                 self.w1, self.w2, self.w3, x, num_tokens_per_expert
             )
 
+    @seeded_init_decorator_for_test(seed=os.environ.get("SEED"))
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.w2, mean=0.0, std=init_std)
@@ -246,6 +249,7 @@ class TokenChoiceTopKRouter(nn.Module):
 
         return top_scores, selected_experts_indices, num_tokens_per_expert
 
+    @seeded_init_decorator_for_test(seed=os.environ.get("SEED"))
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
 
@@ -435,6 +439,7 @@ class MoE(nn.Module):
         out = out.reshape(bs, slen, dim)
         return out
 
+    @seeded_init_decorator_for_test(seed=os.environ.get("SEED"))
     def init_weights(
         self,
         init_std: float,
