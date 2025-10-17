@@ -12,7 +12,7 @@ from typing import Any, Generator, Iterable, Optional
 
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
-
+from torchtitan.utils.test_utils import debug_structure_param
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderExhaustedError
@@ -31,7 +31,6 @@ from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
     maybe_enable_profiling,
 )
-
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     # core configs
@@ -172,7 +171,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             model_param_count,
             self.metrics_processor.num_flops_per_token,
         ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
-
+        
+        debug_structure_param(model)
+        
         logger.info(
             f"{color.blue}Model {job_config.model.name} {job_config.model.flavor} "
             f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
@@ -255,7 +256,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         else:
             # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
             model = self.train_spec.parallelize_fn(model, parallel_dims, job_config)
-
             model.to_empty(device=init_device)
             with torch.no_grad():
                 model.init_weights(buffer_device=buffer_device)
@@ -434,12 +434,17 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         # apply context parallelism if cp is enabled
         # ensure CP handles the separate freqs_cis buffer for each pp stage
-        cp_mesh = parallel_dims.world_mesh["cp"] if parallel_dims.cp_enabled else None
+        cp_buffers = [inputs, labels]
+        cp_seq_dims = [1, 1] 
+        if hasattr(model_parts[0], "freqs_cis"):
+            cp_buffers += [m.freqs_cis for m in model_parts]
+            cp_seq_dims += [0 for _ in model_parts]
+
         optional_context_parallel_ctx = (
             dist_utils.create_context_parallel_ctx(
                 cp_mesh=parallel_dims.world_mesh["cp"],
-                cp_buffers=[inputs, labels] + [m.freqs_cis for m in model_parts],
-                cp_seq_dims=[1, 1] + [0 for _ in model_parts],
+                cp_buffers=cp_buffers,
+                cp_seq_dims=cp_seq_dims,
                 cp_no_restore_buffers={inputs, labels},
                 cp_rotate_method=self.job_config.parallelism.context_parallel_rotate_method,
             )
