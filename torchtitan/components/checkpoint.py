@@ -439,6 +439,10 @@ class CheckpointManager:
                 its own model definition and safetensors format.
         """
 
+        logger.info(f"[DCP LOAD] Starting DCP load from: {checkpoint_id}")
+        logger.info(f"[DCP LOAD] from_hf={from_hf}, from_quantized={from_quantized}")
+        logger.info(f"[DCP LOAD] State dict keys before load: {list(state_dict.keys())}")
+
         if from_hf:
             assert (
                 self.sd_adapter is not None
@@ -448,20 +452,56 @@ class CheckpointManager:
                 checkpoint_id, from_quantized
             )
 
+            logger.info(f"[DCP LOAD] Loading from HF format with storage reader")
             dcp.load(
                 hf_state_dict,
                 storage_reader=hf_storage_reader,
             )
 
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
+            logger.info(f"[DCP LOAD] Converted from HF format, loading into model")
             self.states[MODEL].load_state_dict(state_dict)
+            logger.info(f"[DCP LOAD] Model state loaded successfully from HF")
         else:
+            logger.info(f"[DCP LOAD] Loading from native DCP format")
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
+            logger.info(f"[DCP LOAD] DCP load completed")
 
             # TODO: Since we flatten the model states in state_dict, we need to
             # manually call load_state_dict() for the model. Need to fix this.
             if MODEL in self.states:
+                logger.info(f"[DCP LOAD] Loading model state dict")
                 self.states[MODEL].load_state_dict(state_dict)
+                logger.info(f"[DCP LOAD] Model state loaded successfully")
+        
+        # Log actual parameter values after loading
+        logger.info(f"[DCP LOAD] ===== Verifying loaded parameter values =====")
+        if MODEL in self.states:
+            model_wrapper = self.states[MODEL]
+            for idx, model_part in enumerate(model_wrapper.model):
+                logger.info(f"[DCP LOAD] Model part {idx} parameters:")
+                for name, param in model_part.named_parameters():
+                    logger.info(f"  - {name}:")
+                    logger.info(f"    shape: {param.shape}, dtype: {param.dtype}, device: {param.device}")
+                    logger.info(f"    mean: {param.data.mean().item():.6f}, std: {param.data.std().item():.6f}")
+                    logger.info(f"    min: {param.data.min().item():.6f}, max: {param.data.max().item():.6f}")
+                    # Show first few values
+                    flat_data = param.data.flatten()
+                    logger.info(f"    first 10 values: {flat_data[:10].tolist()}")
+                    logger.info(f"    is all zeros: {torch.all(param.data == 0).item()}")
+                logger.info(f"[DCP LOAD] Model part {idx} total parameters: {sum(p.numel() for p in model_part.parameters()):,}")
+        
+        # Log dataloader state if loaded
+        if DATALOADER in self.states and DATALOADER in state_dict:
+            logger.info(f"[DCP LOAD] Dataloader state check:")
+            dl_state = self.states[DATALOADER].state_dict()
+            logger.info(f"  Dataloader state keys: {list(dl_state.keys())}")
+            if hasattr(self.states[DATALOADER], '_rank_id'):
+                rank_id = self.states[DATALOADER]._rank_id
+                logger.info(f"  Expected rank_id: {rank_id}")
+                logger.info(f"  Rank_id in state: {rank_id in dl_state}")
+        
+        logger.info(f"[DCP LOAD] ===== Load verification complete =====")
 
     @torch.no_grad()
     def save(self, curr_step: int, last_step: bool = False) -> None:
@@ -619,8 +659,10 @@ class CheckpointManager:
                 )
 
         logger.info(f"Loading the checkpoint from {checkpoint_id}.")
+        logger.info(f"[CHECKPOINT LOAD] model_only={model_only}, from_hf={from_hf}")
         begin = time.monotonic()
         states = self._states_to_load(model_only)
+        logger.info(f"[CHECKPOINT LOAD] States to load: {list(states.keys())}")
         self.dcp_load(
             states,
             checkpoint_id=checkpoint_id,

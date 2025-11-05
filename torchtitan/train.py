@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+import lovely_tensors as lt; lt.monkey_patch()
 import importlib
 import os
 import time
@@ -32,6 +32,7 @@ from torchtitan.tools.profiling import (
     maybe_enable_profiling,
 )
 
+from torchtitan.utils.test_utils import debug_structure_param
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     # core configs
@@ -151,10 +152,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
         ):
             model = self.train_spec.model_cls(model_args)
-
         # Build the collection of model converters. No-op if `model.converters` empty
         model_converters = build_model_converters(job_config, parallel_dims)
         model_converters.convert(model)
+
+        debug_structure_param(model)
 
         # metrics logging
         build_metrics_processor_fn = (
@@ -382,11 +384,29 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         """Returns an iterator that processes batches from the data iterator."""
         device_type = utils.device_type
         data_iterator = iter(data_iterable)
+        
+        # Log dataloader state at start
+        logger.info(f"[BATCH GEN] Creating batch generator")
+        if hasattr(data_iterable, 'state_dict'):
+            dl_state = data_iterable.state_dict()
+            logger.info(f"[BATCH GEN] Dataloader state keys: {list(dl_state.keys())}")
 
+        batch_count = 0
         while True:
             data_load_start = time.perf_counter()
             try:
                 batch = next(data_iterator)
+                batch_count += 1
+                
+                # Log first few batches
+                if batch_count <= 3:
+                    logger.info(f"[BATCH GEN] Fetched batch {batch_count}")
+                    input_dict, labels = batch
+                    if 'input' in input_dict:
+                        inp = input_dict['input']
+                        logger.info(f"  Input: shape={inp.shape}, is_zeros={torch.all(inp==0).item()}, first_val={inp.flatten()[0].item()}")
+                    logger.info(f"  Labels: shape={labels.shape}, first_val={labels.flatten()[0].item()}")
+                    
             except StopIteration as ex:
                 # If data runs out during gradient accumulation, that
                 # entire step will not be executed.
@@ -509,6 +529,33 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # entire step will not be executed.
         for _microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
+            
+            # Log first few batches to verify data
+            if self.step == 1 and _microbatch < 2:
+                logger.info(f"[BATCH DATA] ===== Step {self.step}, Microbatch {_microbatch} =====")
+                logger.info(f"[BATCH DATA] input_dict keys: {list(input_dict.keys())}")
+                
+                if 'input' in input_dict:
+                    inp = input_dict['input']
+                    logger.info(f"[BATCH DATA] Input tensor:")
+                    logger.info(f"inp: {inp}")
+                    logger.info(f"  is all zeros: {torch.all(inp == 0).item()}")
+                    logger.info(f"  is all same value: {torch.all(inp == inp.flatten()[0]).item()}")
+                    logger.info(f"  unique values count: {torch.unique(inp).numel()}")
+                    # Show actual token IDs (first 20)
+                    logger.info(f"  first 20 token IDs: {inp.flatten()[:20].tolist()}")
+                    # Show last 20 token IDs
+                    logger.info(f"  last 20 token IDs: {inp.flatten()[-20:].tolist()}")
+                    # Check if it matches expected data
+                    if torch.all(inp == 0):
+                        logger.warning(f"[BATCH DATA] ⚠️  INPUT IS ALL ZEROS - THIS IS THE ISSUE!")
+                
+                logger.info(f"[BATCH DATA] Labels tensor:")
+                logger.info(f"  labels: {labels}")
+                logger.info(f"  first 20 labels: {labels.flatten()[:20].tolist()}")
+                logger.info(f"  last 20 labels: {labels.flatten()[-20:].tolist()}")
+                logger.info(f"  is all same value: {torch.all(labels == labels.flatten()[0]).item()}")
+            
             loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
 
