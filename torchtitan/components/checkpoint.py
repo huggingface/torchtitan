@@ -482,13 +482,13 @@ class CheckpointManager:
                 logger.info(f"[DCP LOAD] Model part {idx} parameters:")
                 for name, param in model_part.named_parameters():
                     logger.info(f"  - {name}:")
-                    logger.info(f"    shape: {param.shape}, dtype: {param.dtype}, device: {param.device}")
-                    logger.info(f"    mean: {param.data.mean().item():.6f}, std: {param.data.std().item():.6f}")
-                    logger.info(f"    min: {param.data.min().item():.6f}, max: {param.data.max().item():.6f}")
+                    logger.info(f"   param: {param}")
                     # Show first few values
-                    flat_data = param.data.flatten()
+                    if isinstance(param, torch.distributed.tensor.DTensor):
+                        flat_data = param.data.to_local().flatten()
+                    else:
+                        flat_data = param.flatten()
                     logger.info(f"    first 10 values: {flat_data[:10].tolist()}")
-                    logger.info(f"    is all zeros: {torch.all(param.data == 0).item()}")
                 logger.info(f"[DCP LOAD] Model part {idx} total parameters: {sum(p.numel() for p in model_part.parameters()):,}")
         
         # Log dataloader state if loaded
