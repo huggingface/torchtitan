@@ -86,12 +86,18 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # State being empty is valid.
         if not state_dict:
+            logger.info(f"[DATALOADER] load_state_dict called with empty state_dict for dp_rank={self.dp_rank}")
             return
+
+        logger.info(f"[DATALOADER] load_state_dict called for dp_rank={self.dp_rank}")
+        logger.info(f"[DATALOADER] Expected rank_id: {self._rank_id}")
+        logger.info(f"[DATALOADER] state_dict keys: {list(state_dict.keys())}")
+        logger.info(f"[DATALOADER] world_size in state: {state_dict.get('world_size', 'NOT FOUND')}, current: {self.dp_world_size}")
 
         if self._rank_id not in state_dict:
             logger.warning(
                 f"DataLoader state is empty for dp rank {self.dp_rank}, "
-                "expected key {self._rank_id}"
+                f"expected key {self._rank_id}. Available keys: {list(state_dict.keys())}"
             )
             return
 
@@ -99,6 +105,12 @@ class ParallelAwareDataloader(StatefulDataLoader, BaseDataLoader):
             "dp_degree is inconsistent before and after checkpoint, "
             "dataloader resharding is not supported yet."
         )
+        
+        logger.info(f"[DATALOADER] Loading state for {self._rank_id}")
+        unpickled_state = pickle.loads(state_dict[self._rank_id])
+        logger.info(f"[DATALOADER] Unpickled state keys: {list(unpickled_state.keys()) if isinstance(unpickled_state, dict) else type(unpickled_state)}")
+        
         # We don't have to use pickle as DCP will serialize the state_dict. However, we have to
         # keep this for backward compatibility.
-        super().load_state_dict(pickle.loads(state_dict[self._rank_id]))
+        super().load_state_dict(unpickled_state)
+        logger.info(f"[DATALOADER] State loaded successfully for dp_rank={self.dp_rank}")

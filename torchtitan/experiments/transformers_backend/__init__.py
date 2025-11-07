@@ -47,7 +47,7 @@ flavors = {
     "debugmodel": HFTransformerModelArgs(
         titan_dense_args=TitanDenseModelArgs(
             dim=256,
-            n_layers=6,
+            n_layers=2,
             n_heads=16,
             n_kv_heads=16,
         ),

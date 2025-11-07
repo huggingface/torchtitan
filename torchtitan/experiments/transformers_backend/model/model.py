@@ -41,6 +41,31 @@ class SlicableModuleDict(nn.ModuleDict):
         return len(self._modules)
 
 
+class SlicableModuleDict(nn.ModuleDict):
+    """
+    A ModuleDict that supports slicing like ModuleList.
+    Keys are expected to be string representations of integers (e.g., "0", "1", "2").
+    """
+    
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            # Handle slicing: convert slice to list of keys
+            keys = sorted(self.keys(), key=lambda x: int(x) if x.isdigit() else float('inf'))
+            sliced_keys = keys[key]
+            # Return a new SlicableModuleDict with the sliced items
+            return SlicableModuleDict({k: self[k] for k in sliced_keys})
+        return super().__getitem__(key)
+    
+    def __iter__(self):
+        # Iterate over values in sorted order by key (as integers)
+        keys = sorted(self.keys(), key=lambda x: int(x) if x.isdigit() else float('inf'))
+        for key in keys:
+            yield self[key]
+    
+    def __len__(self):
+        return len(self._modules)
+
+
 class HFTransformerModel(nn.Module):
     def __init__(self, model_args: HFTransformerModelArgs):
         super().__init__()
