@@ -132,12 +132,6 @@ class Model:
 
 
 @dataclass
-class HFTransformers:
-    model: str = ""
-    """HuggingFace model ID (e.g., 'Qwen/Qwen3-4B-Instruct-2507')"""
-
-
-@dataclass
 class Optimizer:
     name: str = "AdamW"
     """Optimizer to use"""
@@ -268,15 +262,6 @@ class Training:
     Note that you may want to lower the training steps to avoid generating too
     many temporary files.
     """
-
-    seed: int | None = None
-    """Choose the base RNG seed used for training"""
-
-    deterministic: bool = False
-    """Use deterministic algorithms wherever possible, may be slower"""
-
-    debug_moe_force_load_balance: bool = False
-    """If True, we force each experts to get the same amount of tokens via round-robin. This option is for debugging usage only."""
 
 
 @dataclass
@@ -645,6 +630,26 @@ class ActivationCheckpoint:
     https://github.com/pytorch/pytorch/pull/126320#discussion_r1625104015
     """
 
+    preserve_rng_state: bool = False
+    """
+    If deterministic output compared to non-checkpointed passes is required, set
+    to true. Results in stashing and restoring the RNG state during each checkpoint,
+    may be slower. See https://docs.pytorch.org/docs/stable/checkpoint.html
+    for details.
+    """
+
+    determinism_check: str = "default"
+    """
+    A string specifying the determinism function. See
+    https://docs.pytorch.org/docs/stable/checkpoint.html for details.
+    """
+
+    debug: bool = False
+    """
+    Capture ac debug information. Will be slower. See
+    https://docs.pytorch.org/docs/stable/checkpoint.html for details.
+    """
+
 
 @dataclass
 class Compile:
@@ -894,6 +899,21 @@ class Validation:
 
 
 @dataclass
+class Debug:
+    seed: int | None = None
+    """Choose the base RNG seed used for training"""
+
+    deterministic: bool = False
+    """Use deterministic algorithms wherever possible, may be slower"""
+
+    deterministic_warn_only: bool = False
+    """Only warns about ops without deterministic implementations rather than erroring out  """
+
+    moe_force_load_balance: bool = False
+    """If True, we force each experts to get the same amount of tokens via round-robin. This option is for debugging usage only."""
+
+
+@dataclass
 class JobConfig:
     """
     Default container for training configuration.
@@ -903,7 +923,6 @@ class JobConfig:
     profiling: Profiling = field(default_factory=Profiling)
     metrics: Metrics = field(default_factory=Metrics)
     model: Model = field(default_factory=Model)
-    hf_transformers: HFTransformers = field(default_factory=HFTransformers)
     optimizer: Optimizer = field(default_factory=Optimizer)
     lr_scheduler: LRScheduler = field(default_factory=LRScheduler)
     training: Training = field(default_factory=Training)
@@ -919,6 +938,7 @@ class JobConfig:
     fault_tolerance: FaultTolerance = field(default_factory=FaultTolerance)
     experimental: Experimental = field(default_factory=Experimental)
     validation: Validation = field(default_factory=Validation)
+    debug: Debug = field(default_factory=Debug)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -51,7 +51,6 @@ class TrainSpec:
     build_dataloader_fn: DataLoaderBuilder
     build_tokenizer_fn: TokenizerBuilder | None
     build_loss_fn: LossFunctionBuilder
-    name: str | None = None
     build_validator_fn: ValidatorBuilder | None = None
     build_metrics_processor_fn: MetricsProcessorBuilder | None = None
     state_dict_adapter: type[BaseStateDictAdapter] | None = None
@@ -77,6 +76,11 @@ def get_train_spec(name: str) -> TrainSpec:
 
     from torchtitan.experiments import _supported_experiments
     from torchtitan.models import _supported_models
+
+    # If name contains '/', treat it as a HuggingFace model ID and use transformers_backend
+    if "/" in name:
+        module = import_module("torchtitan.experiments.transformers_backend")
+        return module.get_train_spec()
 
     if name in _supported_models:
         module = import_module(f"torchtitan.models.{name}")

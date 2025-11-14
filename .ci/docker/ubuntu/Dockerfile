@@ -1,6 +1,6 @@
-ARG OS_VERSION
+ARG BASE_IMAGE
 
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu${OS_VERSION}
+FROM ${BASE_IMAGE}
 
 ARG OS_VERSION
 
@@ -33,6 +33,7 @@ COPY requirements-dev.txt /opt/conda/
 COPY requirements.txt /opt/conda/
 COPY requirements-flux.txt /opt/conda/
 COPY requirements-vlm.txt /opt/conda/
+COPY requirements-transformers-backend.txt /opt/conda/
 COPY conda-env-ci.txt /opt/conda/
 COPY ./common/install_conda.sh install_conda.sh
 COPY ./common/utils.sh utils.sh

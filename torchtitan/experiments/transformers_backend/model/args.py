@@ -196,7 +196,7 @@ class HFTransformerModelArgs(PretrainedConfig, BaseModelArgs):
     def update_from_config(self, job_config: JobConfig):
         # Load HF config (overwrites our HF attributes)
         hf_model_config = AutoConfig.from_pretrained(
-            job_config.hf_transformers.model,
+            job_config.model.name,
             attn_implementation=self.attn_implementation,
             trust_remote_code=True,
         )
@@ -215,14 +215,13 @@ class HFTransformerModelArgs(PretrainedConfig, BaseModelArgs):
             if hasattr(self, key) and value is not None:
                 setattr(self, key, value)
 
-        if hasattr(job_config.training, 'seq_len') and job_config.training.seq_len != self.max_seq_len:
-            self.max_seq_len = job_config.training.seq_len
-        
         # MoE
         if hasattr(self, "qk_nope_head_dim") and hasattr(self, "qk_rope_head_dim"):
             self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.max_seq_len = job_config.training.seq_len
 
         # Configure HF-specific settings to match TorchTitan settings
+        # TODO: false ?
         self.attention_bias = False
         self.mlp_bias = False
         self.use_cache = False
@@ -245,6 +244,6 @@ class HFTransformerModelArgs(PretrainedConfig, BaseModelArgs):
         is_moe = hasattr(self, "n_routed_experts")
 
         if is_moe:
-            return get_moe_model_nparams_and_flops(self, model, seq_len)
+            return get_moe_model_nparams_and_flops(self, model, head_dims=self.head_dim, seq_len=seq_len)
         else:
-            return get_dense_model_nparams_and_flops(self, model, seq_len)
+            return get_dense_model_nparams_and_flops(self, model, head_dims=self.head_dim, seq_len=seq_len)

@@ -6,7 +6,7 @@ description = "Qwen 3 debug training"
 print_config = true
 
 [profiling]
-enable_profiling = true
+enable_profiling = false
 save_traces_folder = "profile_trace"
 profile_freq = 5
 enable_memory_snapshot = false
@@ -20,14 +20,11 @@ save_tb_folder = "tb"
 enable_wandb = false
 
 [model]
-name = "transformers_backend"
+name = "Qwen/Qwen3-4B-Instruct-2507"
 flavor = "debugmodel"
 # test folder with tokenizer.json, for debug purpose only
 hf_assets_path = "./tests/assets/tokenizer"
 # converters = ["float8"]
-
-[hf_transformers]
-model = "Qwen/Qwen3-4B-Instruct-2507"
 
 [optimizer]
 name = "AdamW"
@@ -41,7 +38,6 @@ decay_type = "linear"
 min_lr_factor = 0.0
 
 [training]
-global_batch_size = 4
 local_batch_size = 2
 seq_len = 2048
 max_norm = 1.0  # grad norm clipping

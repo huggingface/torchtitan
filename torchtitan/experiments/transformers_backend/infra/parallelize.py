@@ -4,168 +4,27 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections import defaultdict
-from typing import Optional
-
 import torch
 import torch.nn as nn
-from torch.distributed._composable.replicate import replicate
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    checkpoint_wrapper as ptd_checkpoint_wrapper,
-)
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, fully_shard, MixedPrecisionPolicy
-from torch.distributed.tensor import Partial, Replicate, Shard
+from torch.distributed.tensor import Replicate, Shard
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     parallelize_module,
     PrepareModuleInput,
-    PrepareModuleInputOutput,
     RowwiseParallel,
     SequenceParallel,
 )
-from torchtitan.config import JobConfig, TORCH_DTYPE_MAP
-from torchtitan.config.job_config import ActivationCheckpoint as ACConfig
+from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import NoParallel, ParallelDims
 
-from torchtitan.distributed.expert_parallel import (
-    ExpertParallel,
-    ExpertTensorParallel,
-    ReordererSequenceParallel,
-)
+from torchtitan.distributed.activation_checkpoint import apply_ac
+
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
+from torchtitan.config.job_config import JobConfig
+from torchtitan.models.llama3.infra.parallelize import apply_compile, apply_ddp
 from torchtitan.tools.logging import logger
-
-# for selective op activation checkpointing
-_save_list = {
-    torch.ops.aten.mm.default,
-    torch.ops.aten._scaled_dot_product_efficient_attention.default,
-    torch.ops.aten._scaled_dot_product_flash_attention.default,
-    torch._higher_order_ops.flex_attention,
-    torch.ops._c10d_functional.reduce_scatter_tensor.default,
-    # for low precision training, it's useful to always save
-    # the result of max, since the absolute maximum is
-    # used to compute the scaling factor for quantization.
-    torch.ops.aten.max.default,
-}
-
-
-def _apply_ac_to_transformer_block(
-    module: nn.Module, ac_config: ACConfig, *, base_fqn: Optional[str] = None
-):
-    valid_ac_modes = ("full", "selective")
-    if ac_config.mode not in valid_ac_modes:
-        raise ValueError(
-            f"Invalid AC mode: {ac_config.mode}. Valid modes: {valid_ac_modes}"
-        )
-
-    if ac_config.mode == "full":
-        return ptd_checkpoint_wrapper(module, preserve_rng_state=False)
-
-    assert ac_config.mode == "selective", f"{ac_config.mode}"
-    use_op_sac = ac_config.selective_ac_option == "op"
-    use_layer_sac = ac_config.selective_ac_option.isdigit()
-    if not use_op_sac and not use_layer_sac:
-        raise ValueError(
-            f"Invalid selective AC option: {ac_config.selective_ac_option}. "
-            f"Valid options: 'op' or a positive int representing layer frequency"
-        )
-    if use_op_sac:
-        from torch.utils.checkpoint import (
-            CheckpointPolicy,
-            create_selective_checkpoint_contexts,
-        )
-
-        mm_recompute_shapes = set()
-        if len(ac_config.per_op_sac_force_recompute_mm_shapes_by_fqns) > 0:
-            for module_fqn, submod in module.named_modules():
-                fqn = module_fqn
-                if base_fqn is not None:
-                    fqn = f"{base_fqn}.{module_fqn}"
-                if not any(
-                    filter_fqn in fqn
-                    for filter_fqn in ac_config.per_op_sac_force_recompute_mm_shapes_by_fqns
-                ):
-                    continue
-                if not isinstance(submod, nn.Linear):
-                    raise ValueError(
-                        "per_op_sac_force_recompute_mm_shapes_by_fqns expected to match "
-                        f"a nn.Linear, but got: {submod}"
-                    )
-                out_f, in_f = submod.weight.shape
-                mm_recompute_shapes.add((in_f, out_f))
-            logger.debug(
-                f"Selective op AC force recomputing mms with rhs shapes {mm_recompute_shapes}"
-            )
-
-        def _get_custom_policy(meta):
-            def _custom_policy(ctx, func, *args, **kwargs):
-                mode = "recompute" if ctx.is_recompute else "forward"
-                mm_count_key = f"{mode}_mm_count"
-                if func == torch.ops.aten.mm.default:
-                    if args[1].shape in mm_recompute_shapes:
-                        return CheckpointPolicy.PREFER_RECOMPUTE
-                    meta[mm_count_key] += 1
-                # Saves output of all compute ops, except every second mm
-                to_save = func in _save_list and not (
-                    func == torch.ops.aten.mm.default and meta[mm_count_key] % 2 == 0
-                )
-                return (
-                    CheckpointPolicy.MUST_SAVE
-                    if to_save
-                    else CheckpointPolicy.PREFER_RECOMPUTE
-                )
-
-            return _custom_policy
-
-        def selective_checkpointing_context_fn():
-            meta = defaultdict(int)
-            return create_selective_checkpoint_contexts(_get_custom_policy(meta))
-
-        return ptd_checkpoint_wrapper(
-            module,
-            context_fn=selective_checkpointing_context_fn,
-            preserve_rng_state=False,
-        )
-    elif use_layer_sac:
-        # Checkpoint every `ac_freq` of the modules passed to this function
-        ac_freq = int(ac_config.selective_ac_option)
-        ptd_checkpoint_wrapper.__dict__.setdefault("_count", 0)
-        ptd_checkpoint_wrapper._count += 1
-        if not ac_freq or ptd_checkpoint_wrapper._count % ac_freq == 0:
-            return ptd_checkpoint_wrapper(module, preserve_rng_state=False)
-        else:
-            return module
-
-
-def apply_ac(model: nn.Module, ac_config: ACConfig):
-    """Apply activation checkpointing to the model."""
-    for layer_id, transformer_block in model.layers.named_children():
-        transformer_block = _apply_ac_to_transformer_block(
-            transformer_block, ac_config, base_fqn=f"layers.{layer_id}"
-        )
-        model.layers.register_module(layer_id, transformer_block)
-
-    logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
-
-
-def apply_ddp(
-    model: nn.Module,
-    dp_mesh: DeviceMesh,
-    enable_compile: bool,
-    enable_compiled_autograd: bool,
-):
-    if enable_compile:
-        if enable_compiled_autograd:
-            torch._dynamo.config.optimize_ddp = (
-                "python_reducer_without_compiled_forward"
-            )
-        else:
-            torch._dynamo.config.optimize_ddp = "ddp_optimizer"
-
-    replicate(model, device_mesh=dp_mesh, bucket_cap_mb=100)
-
-    logger.info("Applied DDP to the model")
 
 
 def parallelize_hf_transformers(
@@ -191,9 +50,6 @@ def parallelize_hf_transformers(
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
 
-    if job_config.parallelism.context_parallel_degree > 1:
-        logger.warning("CP support for FlexAttention is still in progress.")
-
     if parallel_dims.tp_enabled:
         enable_float8_linear = "float8" in job_config.model.converters
         float8_is_rowwise = job_config.quantize.linear.float8.recipe_name in (
@@ -214,64 +70,32 @@ def parallelize_hf_transformers(
         )
         maybe_enable_async_tp(job_config, world_mesh["tp"])
 
-    if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
-        apply_moe_ep_tp(
-            model,
-            tp_mesh=world_mesh["tp"] if parallel_dims.tp_enabled else None,
-            ep_mesh=world_mesh["ep"] if parallel_dims.ep_enabled else None,
-            ep_tp_mesh=(
-                world_mesh["ep", "tp"]
-                if parallel_dims.tp_enabled
-                and parallel_dims.ep_enabled
-                and parallel_dims.etp_enabled
-                else None
-            ),
-            etp_enabled=parallel_dims.etp_enabled,
-        )
+    model_compile_enabled = (
+        job_config.compile.enable and "model" in job_config.compile.components
+    )
 
     if job_config.activation_checkpoint.mode != "none":
         apply_ac(model, job_config.activation_checkpoint)
 
-    model_compile_enabled = (
-        job_config.compile.enable and "model" in job_config.compile.components
-    )
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if model_compile_enabled:
-        # NOTE: needed for torch.compile to work with dynamic shapes in token-choice MoE
-        torch._dynamo.config.capture_scalar_outputs = True
-        apply_compile(model)
+        apply_compile(model, job_config.compile)
 
-    dp_mesh: DeviceMesh | None = None
-    if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
+    if parallel_dims.fsdp_enabled:
         # apply FSDP or HSDP, potentially with Context Parallel
         if parallel_dims.dp_replicate_enabled:
             dp_mesh_dim_names = ("dp_replicate", "dp_shard_cp")
         else:
             dp_mesh_dim_names = ("dp_shard_cp",)
-        dp_mesh = world_mesh[tuple(dp_mesh_dim_names)]
-
-        # the mesh dim names of which the MoE params are sharded on via FSDP/HSDP
-        dp_mod_ep_mesh_dim_names = []
-        if parallel_dims.ep_enabled:
-            if parallel_dims.dp_replicate_enabled:
-                dp_mod_ep_mesh_dim_names.append("dp_replicate")
-            dp_mod_ep_mesh_dim_names.append("dp_shard_mod_ep")
 
         apply_fsdp(
             model,
-            dp_mesh,
+            world_mesh[tuple(dp_mesh_dim_names)],
             param_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[job_config.training.mixed_precision_reduce],
             pp_enabled=parallel_dims.pp_enabled,
             cpu_offload=job_config.training.enable_cpu_offload,
             reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
-            ep_degree=parallel_dims.ep,
-            dp_mod_ep_mesh=(
-                world_mesh[tuple(dp_mod_ep_mesh_dim_names)]
-                if parallel_dims.ep_enabled
-                else None
-            ),
-            gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
         )
 
         if parallel_dims.dp_replicate_enabled:
@@ -288,12 +112,10 @@ def parallelize_hf_transformers(
     elif parallel_dims.dp_replicate_enabled:
         if world_mesh.ndim > 1:
             raise RuntimeError("DDP has not supported > 1D parallelism")
-        dp_mesh = world_mesh
         apply_ddp(
             model,
-            dp_mesh,
+            world_mesh,
             enable_compile=model_compile_enabled,
-            enable_compiled_autograd=job_config.parallelism.enable_compiled_autograd,
         )
 
     return model
@@ -401,13 +223,16 @@ def apply_non_moe_tp(
         layer_plan[f"self_attn.{o_proj_name}"] = rowwise_parallel(
             output_layouts=Shard(1)
         )
-
-        # For Qwen3 RMSNorm on Q and K
-        # TODO(3outeille): we should probably shard(1) then replicate => then use SequenceParallel but for now I am fed up
-        if hasattr(transformer_block.self_attn, "q_norm"):
-            layer_plan["self_attn.q_norm"] = NoParallel()
-        if hasattr(transformer_block.self_attn, "k_norm"):
-            layer_plan["self_attn.k_norm"] = NoParallel()
+        # For model that uses RMSNorm on Q and K (i.e. Qwen3)
+        if hasattr(transformer_block.self_attn, "q_norm") and hasattr(
+            transformer_block.self_attn, "k_norm"
+        ):
+            layer_plan["self_attn.q_norm"] = SequenceParallel(
+                sequence_dim=2, use_local_output=True
+            )
+            layer_plan["self_attn.k_norm"] = SequenceParallel(
+                sequence_dim=2, use_local_output=True
+            )
 
         if not transformer_block.moe_enabled:
             mlp_plan = {
@@ -608,103 +433,3 @@ def apply_fsdp(
                 )
         elif model.tok_embeddings is not None:
             transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
-
-
-def apply_moe_ep_tp(
-    model: nn.Module,
-    tp_mesh: DeviceMesh | None,
-    ep_mesh: DeviceMesh | None,
-    ep_tp_mesh: DeviceMesh | None,
-    etp_enabled: bool,
-):
-    for transformer_block in model.layers:
-        if not transformer_block.moe_enabled:
-            continue
-
-        moe_block = transformer_block.mlp
-        if tp_mesh is not None:
-            moe_layer_plan = {
-                # input / output sharding on the seqlen dim
-                # all-gather for input, reduce-scatter for output
-                "mlp": PrepareModuleInputOutput(
-                    input_layouts=(Shard(1),),
-                    desired_input_layouts=(Replicate(),),
-                    use_local_input=True,
-                    output_layouts=(Partial(),),
-                    desired_output_layouts=(Shard(1),),
-                ),
-                # replicate computation for the router
-                "mlp.gate": NoParallel(),
-            }
-            if ep_mesh is not None and not etp_enabled:
-                # If TP is borrowed for EP, then split the tokens across TP ranks so that
-                # the reorderer, the all-to-all comms, and routed experts computation
-                # are effectively running Sequence Parallel (split along the folded bs*slen dim)
-                moe_layer_plan.update({"mlp.reorderer": ReordererSequenceParallel()})
-            if moe_block.shared_experts is not None:
-                # input Replicate, output Partial
-                moe_layer_plan.update(
-                    {
-                        "mlp.shared_experts.gate_proj": ColwiseParallel(),
-                        "mlp.shared_experts.up_proj": ColwiseParallel(),
-                        "mlp.shared_experts.down_proj": RowwiseParallel(
-                            output_layouts=Partial()
-                        ),
-                    }
-                )
-            parallelize_module(
-                module=transformer_block,
-                device_mesh=tp_mesh,
-                parallelize_plan=moe_layer_plan,
-            )
-
-        if ep_mesh is None:  # This is the TP-only case for experts
-            experts_mesh = tp_mesh
-            expert_tp_plan = {}
-            for i in range(len(moe_block.experts)):
-                expert_tp_plan.update(
-                    {
-                        f"{i}.gate_proj": ColwiseParallel(),
-                        f"{i}.up_proj": ColwiseParallel(),
-                        f"{i}.down_proj": RowwiseParallel(output_layouts=Partial()),
-                    }
-                )
-            parallelize_module(
-                module=moe_block.experts,
-                device_mesh=experts_mesh,
-                parallelize_plan=expert_tp_plan,
-            )
-        else:  # EP or ETP enabled
-            experts_mesh, experts_plan = None, None
-            if tp_mesh is None:
-                experts_mesh = ep_mesh
-                # input / output sharding on the batch / tokens dim
-                experts_plan = ExpertParallel()
-            elif etp_enabled:
-                experts_mesh = ep_tp_mesh
-                experts_plan = ExpertTensorParallel(tp_mesh=tp_mesh, ep_mesh=ep_mesh)
-            else:
-                experts_mesh = ep_mesh
-                experts_plan = ExpertParallel()
-
-            parallelize_module(
-                module=moe_block.experts,
-                device_mesh=experts_mesh,
-                parallelize_plan=experts_plan,
-            )
-
-
-def apply_compile(model: nn.Module):
-    """
-    Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
-    repeated structure. Alternatively one can compile the whole model (after applying DP).
-    """
-    for layer_id, transformer_block in model.layers.named_children():
-        # TODO: remove when torch.compile supports fullgraph=True for MoE
-        fullgraph = True
-        if transformer_block.moe_enabled:
-            fullgraph = False
-        transformer_block = torch.compile(transformer_block, fullgraph=fullgraph)
-        model.layers.register_module(layer_id, transformer_block)
-
-    logger.info("Compiling each TransformerBlock with torch.compile")

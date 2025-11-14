@@ -23,9 +23,9 @@ from torchtitan.hf_datasets.text_datasets import build_text_dataloader
 from torchtitan.models.moe import MoEArgs
 from torchtitan.protocols.train_spec import TrainSpec
 
-from .infra.parallelize_hf_transformers import parallelize_hf_transformers
+from .infra.parallelize import parallelize_hf_transformers
 
-from .infra.pipeline_hf import pipeline_hf_transformers
+from .infra.pipeline import pipeline_hf_transformers
 from .model.args import HFTransformerModelArgs
 from .model.model import HFTransformerModel
 
@@ -82,7 +82,7 @@ flavors = {
     "debugmodel": HFTransformerModelArgs(
         titan_dense_args=TitanDenseModelArgs(
             dim=256,
-            n_layers=6,
+            n_layers=2,
             n_heads=16,
             n_kv_heads=16,
         ),
