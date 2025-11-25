@@ -306,6 +306,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             ),
             base_folder=job_config.job.dump_folder,
             ft_manager=self.ft_manager,
+            model_args=model_args,
         )
 
         loss_parallel_enabled = (

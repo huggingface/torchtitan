@@ -1,3 +1,5 @@
+**/debug_local_results/**
+**/slurm_results/**
 __pycache__
 .idea
 .DS_Store

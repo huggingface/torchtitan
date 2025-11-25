@@ -13,6 +13,7 @@ import torchtitan.protocols.train_spec as train_spec_module
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torchtitan.components.checkpoint import ModelWrapper
 from torchtitan.config import TORCH_DTYPE_MAP
+from transformers import AutoConfig
 
 
 @torch.inference_mode()
@@ -20,6 +21,7 @@ def convert_to_hf(
     input_dir,
     output_dir,
     model_name,
+    hf_transformers_model_name,
     model_flavor,
     hf_assets_path,
     export_dtype,
@@ -27,6 +29,12 @@ def convert_to_hf(
     # load model and model args so that we can get the state dict shape
     train_spec = train_spec_module.get_train_spec(model_name)
     model_args = train_spec.model_args[model_flavor]
+    if model_name == "transformers_modeling_backend":
+        hf_model_config = AutoConfig.from_pretrained(
+            hf_transformers_model_name,
+            trust_remote_code=True,
+        )
+    model_args.architectures = hf_model_config.architectures
 
     with torch.device("cpu"):
         model = train_spec.model_cls(model_args)
@@ -81,6 +89,7 @@ if __name__ == "__main__":
         default="./assets/hf/Llama-3.1-8B",
     )
     parser.add_argument("--model_name", type=str, nargs="?", default="llama3")
+    parser.add_argument("--hf_transformers_model_name", type=str, nargs="?", default=None)
     parser.add_argument("--model_flavor", type=str, nargs="?", default="8B")
     parser.add_argument(
         "--export_dtype",
@@ -91,11 +100,14 @@ if __name__ == "__main__":
         help="Export dtype for HF checkpoint (default: float32)",
     )
     args = parser.parse_args()
-
+    
+    assert args.hf_transformers_model_name is not None and args.model_name == "transformers_modeling_backend", "a proper hf_transformers_model_name is required for transformers_modeling_backend"
+    
     convert_to_hf(
         args.input_dir,
         args.output_dir,
         args.model_name,
+        args.hf_transformers_model_name,
         args.model_flavor,
         args.hf_assets_path,
         args.export_dtype,

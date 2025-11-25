@@ -185,10 +185,11 @@ class CheckpointManager:
         sd_adapter: BaseStateDictAdapter | None,
         base_folder: str = "",
         ft_manager: FTManager | None = None,
+        model_args: Any | None = None,
     ) -> None:
         self.enable = checkpoint_config.enable
         self.load_only = checkpoint_config.load_only
-
+        self.model_args = model_args
         self.states = states
         self.states.update(
             {
@@ -789,7 +790,12 @@ class CheckpointManager:
             enable_garbage_collection=True,
             to_hf=self.last_save_in_hf,
         )
-
+        # if self.model_args is not None:
+        #     if dist.get_rank() == 0:  # Only rank 0 saves the config
+        #         checkpoint_id = self._create_checkpoint_id(curr_step)
+        #         self.model_args.save_pretrained(checkpoint_id)
+        #         logger.info(f"Saved HuggingFace config to {checkpoint_id}")
+    
     def _should_save(self, curr_step: int, last_step: bool = False) -> bool:
         if not self.enable or self.load_only:
             return False

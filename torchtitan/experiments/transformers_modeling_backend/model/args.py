@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
-
+from typing import Optional
 from torch import nn
 from torchtitan.config.job_config import JobConfig
 from torchtitan.models.utils import get_dense_model_nparams_and_flops
@@ -75,7 +75,8 @@ class HFTransformerModelArgs(PretrainedConfig, BaseModelArgs):
         **kwargs,
     ):
         super().__init__(attn_implementation=attn_implementation, **kwargs)
-        assert titan_dense_args is not None, "titan_dense_args is required"
+        # if titan_dense_args is None:
+            # titan_dense_args = TitanDenseModelArgs()
 
         # Create getter/setter dynamically for TT <-> HF attribute mappings
         self._create_getter_setter_dynamically(has_moe=False)
