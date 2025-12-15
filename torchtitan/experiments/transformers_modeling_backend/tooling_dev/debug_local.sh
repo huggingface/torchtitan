@@ -22,11 +22,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 # create a list of model_name
+# tt_model_names=(
+#     "llama3"
+# )
 
 model_names=(
-    # "meta-llama/Llama-3.2-1B"  # ✅
+    "meta-llama/Llama-3.2-1B"  # ✅
     # "microsoft/phi-2" # ✅/
-    "Qwen/Qwen2.5-7B" # ✅
+    # "Qwen/Qwen2.5-7B" # ✅
     # "mistralai/Mistral-7B-v0.1" # ✅
     # "google/gemma-3-270m" # ❌ new layers to handle 
     # "ByteDance-Seed/Seed-Coder-8B-Instruct" # ✅
@@ -42,10 +45,23 @@ model_names=(
 # )
 
 
+# for tt_model_name in "${tt_model_names[@]}"; do
+#     rm -rf debug_local_results/${tt_model_name}
+
+#     python ./tooling_dev/test_hf_integration.py create_configs --model_name "$tt_model_name" --out_dir debug_local_results --flavor $FLAVOR $COMPILE_FLAG --model_type torchtitan
+#     python ./tooling_dev/test_hf_integration.py submit_jobs --inp_dir debug_local_results/${tt_model_name}/${FLAVOR}/seed_checkpoint --qos high
+#     while [ ! -f debug_local_results/${tt_model_name}/${FLAVOR}/seed_checkpoint/status.txt ] || [ "$(cat debug_local_results/${tt_model_name}/${FLAVOR}/seed_checkpoint/status.txt)" != "completed" ]; do
+#         echo "Waiting for seed checkpoint from ${tt_model_name} to complete ..."
+#         sleep 1
+#     done
+#     python ./tooling_dev/test_hf_integration.py submit_jobs --inp_dir debug_local_results/${tt_model_name}/${FLAVOR} --qos high
+#     echo "================"
+# done
+
 for model_name in "${model_names[@]}"; do
     rm -rf debug_local_results/${model_name}
 
-    python ./tooling_dev/test_hf_integration.py create_configs --model_name "$model_name" --out_dir debug_local_results --flavor $FLAVOR $COMPILE_FLAG
+    python ./tooling_dev/test_hf_integration.py create_configs --model_name "$model_name" --out_dir debug_local_results --flavor $FLAVOR $COMPILE_FLAG --model_type transformers_modeling_backend
     python ./tooling_dev/test_hf_integration.py submit_jobs --inp_dir debug_local_results/${model_name}/${FLAVOR}/seed_checkpoint --qos high
     while [ ! -f debug_local_results/${model_name}/${FLAVOR}/seed_checkpoint/status.txt ] || [ "$(cat debug_local_results/${model_name}/${FLAVOR}/seed_checkpoint/status.txt)" != "completed" ]; do
         echo "Waiting for seed checkpoint from ${model_name} to complete ..."

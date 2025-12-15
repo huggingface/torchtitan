@@ -74,6 +74,7 @@ def _create_slurm_script(
     job_name: str,
     initial_load_path: str = None,
     repo_id: str = None,
+    model_type: str = "transformers_modeling_backend",
 ):
     with open(config_path, "r") as file:
         config = toml.load(file)
@@ -103,7 +104,8 @@ def _create_slurm_script(
         "config_path": config_path,
         "initial_load_path": initial_load_path,
         "repo_id": repo_id,
-        "qos": "high" if nodes > 1 else "normal",  # Example logic for qos
+        "qos": "high" if nodes > 1 else "normal",
+        "model_type": model_type,
     }
 
     with open(script_path, "w") as file:
@@ -156,16 +158,27 @@ def create_configs(model_name: str, out_dir: str, flavor: str, model_type: str =
     with open(base_config, "r") as f:
         config = toml.load(f)
 
-    config["model"]["name"] = "transformers_modeling_backend"
-    # creeate a new hf_transformers section
-    config["hf_transformers"] = {}
-    config["hf_transformers"]["model"] = model_name
-    config["model"]["flavor"] = flavor
-    
-    # Extract just the model name from repo_id (e.g., "Llama-3.2-1B" from "meta-llama/Llama-3.2-1B")
-    # download_hf_assets.py creates directories using only the model name part
-    model_name_only = model_name.split("/")[-1] if "/" in model_name else model_name
-    config["model"]["hf_assets_path"] = f"./{out_dir}/{model_name}/assets/hf/{model_name_only}"
+    # Configure based on model_type
+    if model_type == "transformers_modeling_backend":
+        config["model"]["name"] = "transformers_modeling_backend"
+        # Create a new hf_transformers section
+        config["hf_transformers"] = {}
+        config["hf_transformers"]["model"] = model_name
+        config["model"]["flavor"] = flavor
+        
+        # Use provided hf_assets_path or default
+        if hf_assets_path:
+            config["model"]["hf_assets_path"] = hf_assets_path
+        else:
+            # Extract just the model name from repo_id (e.g., "Llama-3.2-1B" from "meta-llama/Llama-3.2-1B")
+            model_name_only = model_name.split("/")[-1] if "/" in model_name else model_name
+            config["model"]["hf_assets_path"] = f"./{out_dir}/{model_name}/assets/hf/{model_name_only}"
+    elif model_type == "torchtitan":
+        config["model"]["name"] = model_name
+        config["model"]["flavor"] = flavor
+        config["model"]["hf_assets_path"] = hf_assets_path or "/fsx/ferdinandmom/ferdinand-hf/huggingface/torchtitan/tests/assets/tokenizer"
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}. Must be 'transformers_modeling_backend' or 'torchtitan'")
     
     # Set absolute path to dataset to avoid path resolution issues
     config["training"]["dataset_path"] = "/fsx/ferdinandmom/ferdinand-hf/huggingface/torchtitan/tests/assets/c4_test"
@@ -234,7 +247,8 @@ def create_configs(model_name: str, out_dir: str, flavor: str, model_type: str =
         seed_config_path,
         seed_checkpoint_dir / "seed.slurm",
         "seed_checkpoint",
-        repo_id=model_name,
+        repo_id=model_name if model_type == "transformers_modeling_backend" else None,
+        model_type=model_type,
     )
 
     # Create parallelism configs
@@ -274,7 +288,8 @@ def create_configs(model_name: str, out_dir: str, flavor: str, model_type: str =
             pc_dir / "nd_parallelism.slurm",
             pc,
             initial_load_path=str(seed_checkpoint_dir / "checkpoint/step-0"),
-            repo_id=model_name,
+            repo_id=model_name if model_type == "transformers_modeling_backend" else None,
+            model_type=model_type,
         )
 
 class Status(Enum):

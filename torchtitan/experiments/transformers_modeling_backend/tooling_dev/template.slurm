@@ -88,7 +88,7 @@ update_status $job_id {{ root_path }}/status.txt &
 #    --job.config_file {{ config_path }}"
 
 
-{% if name == "seed_checkpoint" %}python /fsx/ferdinandmom/ferdinand-hf/huggingface/torchtitan/scripts/download_hf_assets.py --repo_id {{ repo_id }} --assets tokenizer --local_dir {{ root_path }}/../../assets/hf {% endif %}
+{% if name == "seed_checkpoint" and model_type == "transformers_modeling_backend" %}python /fsx/ferdinandmom/ferdinand-hf/huggingface/torchtitan/scripts/download_hf_assets.py --repo_id {{ repo_id }} --assets tokenizer --local_dir {{ root_path }}/../../assets/hf {% endif %}
 
 CMD="torchrun \
    --nproc_per_node {{ n_proc_per_node }} \
