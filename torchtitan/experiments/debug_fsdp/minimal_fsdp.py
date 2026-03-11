@@ -273,7 +273,7 @@ def _prepare_hf_pretrained_dir(job_config: JobConfig) -> Path:
     return out_dir
 
 
-def build_hf_fsdp_model(job_config, world_size):
+def build_hf_fsdp_model(job_config, device, world_size):
     """Build model via HF from_pretrained with fsdp_plan=auto."""
     v5_path = str(Path(__file__).resolve().parents[3] / "transformers-v5-fsdp" / "src")
     if v5_path not in sys.path:
@@ -288,10 +288,15 @@ def build_hf_fsdp_model(job_config, world_size):
 
     rank_zero_log(f"Building HF model from {model_dir}")
 
+    fsdp_mesh = torch.distributed.init_device_mesh(
+        device.type, (world_size,), mesh_dim_names=("dp_shard",)
+    )
     model = AutoModelForCausalLM.from_pretrained(
         str(model_dir),
         torch_dtype=torch.float32,
+        device_map=device,
         fsdp_plan={"mode": "auto", "cpu_offload": False, "mixed_precision": False},
+        fsdp_device_mesh=fsdp_mesh,
     )
 
     # Param count (local shard × world_size for full count)
@@ -484,7 +489,7 @@ def main() -> None:
         if USE_HF_FSDP:
             rank_zero_log("Backend: HF from_pretrained + manual FSDP")
             model, num_flops_per_token = build_hf_fsdp_model(
-                job_config, dist.get_world_size()
+                job_config, device, dist.get_world_size()
             )
         else:
             rank_zero_log(f"Backend: torchtitan ({job_config.model.name})")
