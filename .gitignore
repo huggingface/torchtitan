@@ -12,6 +12,8 @@ dist/*
 data
 out
 wandb
+*_results
+debugperf_large
 
 torchtitan/datasets/**/*.model
 

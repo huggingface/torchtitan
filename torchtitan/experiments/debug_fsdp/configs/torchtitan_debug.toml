@@ -1,8 +1,8 @@
-# Minimal FSDP debug config — Native TorchTitan Llama 3
+# Minimal FSDP debug config — TorchTitan backend
 
 [job]
 dump_folder = "./outputs"
-description = "Minimal FSDP debug (native Llama 3)"
+description = "Minimal FSDP debug (torchtitan backend)"
 print_config = true
 
 [metrics]

@@ -1,4 +1,4 @@
-# Minimal FSDP debug config — HF Transformers modeling backend
+# Minimal FSDP debug config — HF Transformers backend
 
 [job]
 dump_folder = "./outputs"
