@@ -34,6 +34,7 @@ from torchtitan.components.metrics import DeviceMemoryMonitor
 from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.models.llama3.model.state_dict_adapter import Llama3StateDictAdapter
+from torchtitan.models.llama4.infra.parallelize import apply_fsdp
 from torchtitan.models.qwen3.model.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.train_spec import get_train_spec, TrainSpec
 from torchtitan.tools import utils as titan_utils
@@ -225,12 +226,23 @@ def build_and_parallelize_torchtitan(job_config, train_spec, parallel_dims, devi
     if load_shared_seed:
         load_seed_into_torchtitan_model(model, model_args, job_config)
         model.to(device)
-        model = train_spec.parallelize_fn(model, parallel_dims, job_config)
     else:
-        model = train_spec.parallelize_fn(model, parallel_dims, job_config)
         model.to_empty(device=device)
         with torch.no_grad():
             model.init_weights()
+
+    dp_mesh_dim_names = ("dp_shard",)
+    #TODO(3ou): add mixed precision support and cpu_offload support
+    apply_fsdp(
+        model,
+        parallel_dims.world_mesh[tuple(dp_mesh_dim_names)],
+        param_dtype=None,
+        reduce_dtype=None,
+        pp_enabled=parallel_dims.pp_enabled,
+        # cpu_offload=job_config.training.enable_cpu_offload,
+        cpu_offload=False,
+        reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
+    )
 
     model.train()
     return model, num_flops_per_token
@@ -261,7 +273,7 @@ def _prepare_hf_pretrained_dir(job_config: JobConfig) -> Path:
     return out_dir
 
 
-def build_hf_fsdp_model(job_config, device, world_size):
+def build_hf_fsdp_model(job_config, world_size):
     """Build model via HF from_pretrained with fsdp_plan=auto."""
     v5_path = str(Path(__file__).resolve().parents[3] / "transformers-v5-fsdp" / "src")
     if v5_path not in sys.path:
@@ -274,12 +286,11 @@ def build_hf_fsdp_model(job_config, device, world_size):
     dist.barrier()
     model_dir = Path(job_config.job.dump_folder) / "hf_fsdp_pretrained"
 
-    param_dtype = TORCH_DTYPE_MAP[job_config.training.mixed_precision_param]
-    rank_zero_log(f"Building HF model from {model_dir} (torch_dtype={param_dtype})")
+    rank_zero_log(f"Building HF model from {model_dir}")
 
     model = AutoModelForCausalLM.from_pretrained(
         str(model_dir),
-        torch_dtype=param_dtype,
+        torch_dtype=torch.float32,
         fsdp_plan={"mode": "auto", "cpu_offload": False, "mixed_precision": False},
     )
 
@@ -473,7 +484,7 @@ def main() -> None:
         if USE_HF_FSDP:
             rank_zero_log("Backend: HF from_pretrained + manual FSDP")
             model, num_flops_per_token = build_hf_fsdp_model(
-                job_config, device, dist.get_world_size()
+                job_config, dist.get_world_size()
             )
         else:
             rank_zero_log(f"Backend: torchtitan ({job_config.model.name})")
