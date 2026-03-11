@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
+"""
+Minimal TorchTitan FSDP debug script with synthetic data.
+Supports both native TorchTitan models (e.g. llama3) and the
+HF Transformers modeling backend.
+
+Usage (with a TOML config):
+    torchrun --nproc_per_node=2 minimal_fsdp.py \
+        --job.config_file path/to/config.toml
+
+Any TOML field can be overridden from the CLI, e.g.:
+    torchrun --nproc_per_node=2 minimal_fsdp.py \
+        --job.config_file path/to/config.toml \
+        --training.steps 20
+"""
 
 from __future__ import annotations
 
-import argparse
 import copy
 import os
 import time
 from dataclasses import dataclass
 from datetime import timedelta
-from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -16,44 +28,12 @@ import torch.nn.functional as F
 from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.metrics import DeviceMemoryMonitor
-from torchtitan.config import Comm, Debug, TORCH_DTYPE_MAP
+from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
-from torchtitan.experiments.transformers_modeling_backend.infra.parallelize import (
-    apply_fsdp,
-)
-from torchtitan.experiments.transformers_modeling_backend.model.args import (
-    HFTransformerModelArgs,
-    TitanDenseModelArgs,
-)
-from torchtitan.experiments.transformers_modeling_backend.model.model import (
-    HFTransformerModel,
-)
+from torchtitan.protocols.train_spec import BaseModelArgs, get_train_spec, TrainSpec
 from torchtitan.tools import utils as titan_utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import device_module, device_type, set_default_dtype
-
-
-FLAVORS = {
-    "debugmodel": HFTransformerModelArgs(
-        titan_dense_args=TitanDenseModelArgs(
-            dim=256,
-            n_layers=2,
-            n_heads=16,
-            n_kv_heads=16,
-            vocab_size=2048,
-        ),
-    ),
-    "full": HFTransformerModelArgs(
-        titan_dense_args=TitanDenseModelArgs(),
-    ),
-}
-
-
-@dataclass
-class RuntimeConfig:
-    hf_transformers: SimpleNamespace
-    training: SimpleNamespace
-    debug: SimpleNamespace
 
 
 @dataclass
@@ -77,126 +57,33 @@ class PerfStats:
             self.post_warmup_mfu = []
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Minimal TorchTitan FSDP debug script using the Hugging Face "
-            "transformers modeling backend with a Llama 3 architecture."
-        )
-    )
-    parser.add_argument(
-        "--hf-model",
-        default="meta-llama/Llama-3.2-1B",
-        help="HF model id or local config path used to pick the architecture/config.",
-    )
-    parser.add_argument(
-        "--flavor",
-        default="debugmodel",
-        choices=sorted(FLAVORS.keys()),
-        help="TorchTitan backend flavor. debugmodel keeps the network tiny.",
-    )
-    parser.add_argument("--steps", type=int, default=10, help="Number of train steps.")
-    parser.add_argument(
-        "--batch-size", type=int, default=2, help="Per-rank batch size for synthetic data."
-    )
-    parser.add_argument(
-        "--seq-len", type=int, default=512, help="Sequence length for synthetic tokens."
-    )
-    parser.add_argument("--lr", type=float, default=8e-4, help="AdamW learning rate.")
-    parser.add_argument(
-        "--max-norm", type=float, default=1.0, help="Gradient clipping max norm."
-    )
-    parser.add_argument(
-        "--weight-decay", type=float, default=0.1, help="AdamW weight decay."
-    )
-    parser.add_argument(
-        "--init-dtype",
-        default="float32",
-        choices=sorted(TORCH_DTYPE_MAP.keys()),
-        help="Default dtype used while materializing the model.",
-    )
-    parser.add_argument(
-        "--param-dtype",
-        default="float32",
-        choices=sorted(TORCH_DTYPE_MAP.keys()),
-        help="FSDP mixed-precision parameter dtype.",
-    )
-    parser.add_argument(
-        "--reduce-dtype",
-        default="float32",
-        choices=sorted(TORCH_DTYPE_MAP.keys()),
-        help="FSDP reduction dtype.",
-    )
-    parser.add_argument(
-        "--reshard-after-forward",
-        default="default",
-        choices=("default", "always", "never"),
-        help="Pass-through to TorchTitan's FSDP helper.",
-    )
-    parser.add_argument("--seed", type=int, default=2026, help="Base RNG seed.")
-    parser.add_argument(
-        "--deterministic",
-        action="store_true",
-        help="Enable deterministic algorithms where possible.",
-    )
-    parser.add_argument(
-        "--log-every", type=int, default=1, help="Rank-0 log frequency in steps."
-    )
-    parser.add_argument(
-        "--warmup-steps",
-        type=int,
-        default=2,
-        help="Number of initial steps excluded from the final throughput summary.",
-    )
-    parser.add_argument(
-        "--disable-color-printing",
-        action="store_true",
-        help="Disable ANSI colors in rank-0 metric logging.",
-    )
-    parser.add_argument(
-        "--train-timeout-seconds",
-        type=int,
-        default=100,
-        help="Timeout applied to all process groups after the first train step.",
-    )
-    return parser.parse_args()
-
-
 def rank_zero_log(message: str) -> None:
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info(message)
 
 
-def build_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
-    return RuntimeConfig(
-        hf_transformers=SimpleNamespace(model=args.hf_model),
-        training=SimpleNamespace(seq_len=args.seq_len),
-        debug=SimpleNamespace(deterministic=args.deterministic),
-    )
-
-
-def build_model(args: argparse.Namespace) -> tuple[HFTransformerModel, HFTransformerModelArgs]:
-    model_args = copy.deepcopy(FLAVORS[args.flavor])
-    model_args.update_from_config(build_runtime_config(args))
+def build_model(
+    job_config: JobConfig,
+    train_spec: TrainSpec,
+) -> tuple[torch.nn.Module, BaseModelArgs]:
+    flavor = job_config.model.flavor
+    model_args = copy.deepcopy(train_spec.model_args[flavor])
+    model_args.update_from_config(job_config)
 
     rank_zero_log(
-        "Building HF backend model "
-        f"hf_model={args.hf_model} flavor={args.flavor} "
-        f"layers={model_args.n_layers} dim={model_args.dim} "
-        f"heads={model_args.n_heads} vocab={model_args.vocab_size} "
-        f"seq_len={model_args.max_seq_len}"
+        f"Building {job_config.model.name} {flavor} with {model_args}"
     )
 
     with (
         torch.device("meta"),
-        set_default_dtype(TORCH_DTYPE_MAP[args.init_dtype]),
+        set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
     ):
-        model = HFTransformerModel(model_args)
+        model = train_spec.model_cls(model_args)
 
     return model, model_args
 
 
-def init_distributed(args: argparse.Namespace) -> tuple[torch.device, ParallelDims]:
+def init_distributed(job_config: JobConfig) -> tuple[torch.device, ParallelDims]:
     required_env = ("RANK", "LOCAL_RANK", "WORLD_SIZE")
     missing_env = [name for name in required_env if name not in os.environ]
     if missing_env:
@@ -221,30 +108,23 @@ def init_distributed(args: argparse.Namespace) -> tuple[torch.device, ParallelDi
     device = torch.device(f"cuda:{local_rank}")
     device_module.set_device(device)
 
-    comm_config = Comm(trace_buf_size=0)
-    dist_utils.init_distributed(comm_config, enable_cpu_backend=False)
+    dist_utils.init_distributed(job_config.comm, enable_cpu_backend=False)
 
     parallel_dims = ParallelDims(
-        dp_replicate=1,
-        # ParallelDims only accepts -1 as the "use remaining ranks" sentinel.
-        dp_shard=-1,
-        cp=1,
-        tp=1,
-        pp=1,
-        ep=1,
-        etp=1,
+        dp_replicate=job_config.parallelism.data_parallel_replicate_degree,
+        dp_shard=job_config.parallelism.data_parallel_shard_degree,
+        cp=job_config.parallelism.context_parallel_degree,
+        tp=job_config.parallelism.tensor_parallel_degree,
+        pp=job_config.parallelism.pipeline_parallel_degree,
+        ep=job_config.parallelism.expert_parallel_degree,
+        etp=job_config.parallelism.expert_tensor_parallel_degree,
         world_size=world_size,
     )
 
-    debug_config = Debug(
-        seed=args.seed,
-        deterministic=args.deterministic,
-        deterministic_warn_only=args.deterministic,
-    )
     dist_utils.set_determinism(
         parallel_dims.world_mesh,
         device,
-        debug_config,
+        job_config.debug,
         distinct_seed_mesh_dims=[],
     )
 
@@ -255,39 +135,14 @@ def init_distributed(args: argparse.Namespace) -> tuple[torch.device, ParallelDi
     return device, parallel_dims
 
 
-def assert_fsdp_only(parallel_dims: ParallelDims) -> None:
-    if not parallel_dims.dp_shard_enabled:
-        raise RuntimeError("This debug script requires FSDP sharding to be enabled.")
-    if parallel_dims.dp_replicate_enabled:
-        raise RuntimeError("This debug script is FSDP-only and does not support DDP/HSDP.")
-    if (
-        parallel_dims.cp_enabled
-        or parallel_dims.tp_enabled
-        or parallel_dims.pp_enabled
-        or parallel_dims.ep_enabled
-        or parallel_dims.etp_enabled
-    ):
-        raise RuntimeError(
-            "This debug script is FSDP-only and requires cp=tp=pp=ep=etp=1."
-        )
-
-
-def materialize_and_wrap_model(
-    model: HFTransformerModel,
-    args: argparse.Namespace,
+def parallelize_and_materialize(
+    model: torch.nn.Module,
+    train_spec: TrainSpec,
+    job_config: JobConfig,
     parallel_dims: ParallelDims,
     device: torch.device,
-) -> HFTransformerModel:
-    assert_fsdp_only(parallel_dims)
-    apply_fsdp(
-        model,
-        parallel_dims.world_mesh["dp_shard_cp"],
-        param_dtype=TORCH_DTYPE_MAP[args.param_dtype],
-        reduce_dtype=TORCH_DTYPE_MAP[args.reduce_dtype],
-        pp_enabled=False,
-        cpu_offload=False,
-        reshard_after_forward_policy=args.reshard_after_forward,
-    )
+) -> torch.nn.Module:
+    model = train_spec.parallelize_fn(model, parallel_dims, job_config)
 
     model.to_empty(device=device)
     with torch.no_grad():
@@ -330,10 +185,12 @@ def get_global_mean(value: torch.Tensor, parallel_dims: ParallelDims) -> float:
 def init_perf_stats(
     device: torch.device,
     num_flops_per_token: int,
-    args: argparse.Namespace,
+    job_config: JobConfig,
 ) -> PerfStats:
     color = (
-        titan_utils.NoColor() if args.disable_color_printing else titan_utils.Color()
+        titan_utils.NoColor()
+        if job_config.metrics.disable_color_printing
+        else titan_utils.Color()
     )
     device_memory_monitor = DeviceMemoryMonitor(str(device))
     gpu_peak_flops = titan_utils.get_peak_flops(device_memory_monitor.device_name)
@@ -414,41 +271,52 @@ def log_post_warmup_summary(perf_stats: PerfStats, warmup_steps: int) -> None:
 @record
 def main() -> None:
     init_logger()
-    args = parse_args()
+    config_manager = ConfigManager()
+    job_config = config_manager.parse_args()
 
-    device, parallel_dims = init_distributed(args)
+    train_spec = get_train_spec(job_config.model.name)
+
+    device, parallel_dims = init_distributed(job_config)
     try:
-        model, model_args = build_model(args)
-        _, num_flops_per_token = model_args.get_nparams_and_flops(model, args.seq_len)
-        model = materialize_and_wrap_model(model, args, parallel_dims, device)
-        perf_stats = init_perf_stats(device, num_flops_per_token, args)
+        model, model_args = build_model(job_config, train_spec)
+        seq_len = job_config.training.seq_len
+        _, num_flops_per_token = model_args.get_nparams_and_flops(model, seq_len)
+        model = parallelize_and_materialize(
+            model, train_spec, job_config, parallel_dims, device
+        )
+        perf_stats = init_perf_stats(device, num_flops_per_token, job_config)
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
+            lr=job_config.optimizer.lr,
+            weight_decay=job_config.optimizer.weight_decay,
         )
 
         world_size = dist.get_world_size()
-        vocab_size = model.model.config.vocab_size
-        tokens_per_step = args.batch_size * args.seq_len * world_size
+        batch_size = job_config.training.local_batch_size
+        steps = job_config.training.steps
+        max_norm = job_config.training.max_norm
+        warmup_steps = job_config.lr_scheduler.warmup_steps
+        log_freq = job_config.metrics.log_freq
+        vocab_size = model_args.vocab_size
+        tokens_per_step = batch_size * seq_len * world_size
         rank_zero_log(
             "Trainer is initialized with "
-            f"local batch size {args.batch_size}, "
-            f"global batch size {args.batch_size * world_size}, "
+            f"local batch size {batch_size}, "
+            f"global batch size {batch_size * world_size}, "
             "gradient accumulation steps 1, "
-            f"sequence length {args.seq_len}, "
-            f"total steps {args.steps} (warmup {args.warmup_steps})"
+            f"sequence length {seq_len}, "
+            f"total steps {steps} (warmup {warmup_steps})"
         )
         rank_zero_log("Training starts at step 1")
         perf_stats.time_last_log = time.perf_counter()
 
-        for step in range(1, args.steps + 1):
+        for step in range(1, steps + 1):
             optimizer.zero_grad(set_to_none=True)
 
             tokens = make_synthetic_batch(
-                batch_size=args.batch_size,
-                seq_len=args.seq_len,
+                batch_size=batch_size,
+                seq_len=seq_len,
                 vocab_size=vocab_size,
                 device=device,
             )
@@ -459,7 +327,7 @@ def main() -> None:
 
             grad_norm = dist_utils.clip_grad_norm_(
                 list(model.parameters()),
-                max_norm=args.max_norm,
+                max_norm=max_norm,
                 foreach=True,
             )
             optimizer.step()
@@ -468,7 +336,7 @@ def main() -> None:
                 torch.cuda.synchronize(device)
             perf_stats.ntokens_since_last_log += tokens_per_step
 
-            if step % args.log_every == 0 or step == 1 or step == args.steps:
+            if step % log_freq == 0 or step == 1 or step == steps:
                 avg_loss = get_global_mean(loss, parallel_dims)
                 log_train_step(
                     step=step,
@@ -476,17 +344,19 @@ def main() -> None:
                     grad_norm=grad_norm.item(),
                     perf_stats=perf_stats,
                     parallel_dims=parallel_dims,
-                    warmup_steps=args.warmup_steps,
+                    warmup_steps=warmup_steps,
                 )
 
             if step == 1:
                 dist_utils.set_pg_timeouts(
-                    timeout=timedelta(seconds=args.train_timeout_seconds),
+                    timeout=timedelta(
+                        seconds=job_config.comm.train_timeout_seconds
+                    ),
                     world_mesh=parallel_dims.world_mesh,
                 )
 
         dist.barrier()
-        log_post_warmup_summary(perf_stats, args.warmup_steps)
+        log_post_warmup_summary(perf_stats, warmup_steps)
         rank_zero_log("Training completed")
     finally:
         if dist.is_initialized():
