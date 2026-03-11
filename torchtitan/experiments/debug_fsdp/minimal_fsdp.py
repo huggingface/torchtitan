@@ -17,23 +17,35 @@ Any TOML field can be overridden from the CLI, e.g.:
 from __future__ import annotations
 
 import copy
+import json
 import os
 import time
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from datasets import config as datasets_config
 from torch.distributed.elastic.multiprocessing.errors import record
 
+from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.metrics import DeviceMemoryMonitor
 from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.models.llama3.model.state_dict_adapter import Llama3StateDictAdapter
+from torchtitan.models.qwen3.model.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.train_spec import BaseModelArgs, get_train_spec, TrainSpec
 from torchtitan.tools import utils as titan_utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import device_module, device_type, set_default_dtype
+
+
+SEED_CHECKPOINT_FILENAME = "seed_model.pt"
+SEED_CHECKPOINT_METADATA_FILENAME = "seed_model.json"
+HF_ALLOWED_MISSING_KEY_SUFFIXES = ("rotary_emb.inv_freq",)
+HF_TIED_WEIGHT_ALLOWED_MISSING_KEY_SUFFIXES = ("lm_head.weight",)
 
 
 @dataclass
@@ -65,6 +77,7 @@ def rank_zero_log(message: str) -> None:
 def build_model(
     job_config: JobConfig,
     train_spec: TrainSpec,
+    use_meta_init: bool = True,
 ) -> tuple[torch.nn.Module, BaseModelArgs]:
     flavor = job_config.model.flavor
     model_args = copy.deepcopy(train_spec.model_args[flavor])
@@ -74,11 +87,12 @@ def build_model(
         f"Building {job_config.model.name} {flavor} with {model_args}"
     )
 
-    with (
-        torch.device("meta"),
-        set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
-    ):
-        model = train_spec.model_cls(model_args)
+    with set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]):
+        if use_meta_init:
+            with torch.device("meta"):
+                model = train_spec.model_cls(model_args)
+        else:
+            model = train_spec.model_cls(model_args)
 
     return model, model_args
 
@@ -108,7 +122,11 @@ def init_distributed(job_config: JobConfig) -> tuple[torch.device, ParallelDims]
     device = torch.device(f"cuda:{local_rank}")
     device_module.set_device(device)
 
-    dist_utils.init_distributed(job_config.comm, enable_cpu_backend=False)
+    dist_utils.init_distributed(
+        job_config.comm,
+        enable_cpu_backend=False,
+        base_folder=job_config.job.dump_folder,
+    )
 
     parallel_dims = ParallelDims(
         dp_replicate=job_config.parallelism.data_parallel_replicate_degree,
@@ -151,28 +169,77 @@ def parallelize_and_materialize(
     return model
 
 
-def make_synthetic_batch(
-    batch_size: int,
-    seq_len: int,
-    vocab_size: int,
+def move_and_parallelize_loaded_model(
+    model: torch.nn.Module,
+    train_spec: TrainSpec,
+    job_config: JobConfig,
+    parallel_dims: ParallelDims,
     device: torch.device,
-) -> torch.Tensor:
-    if vocab_size <= 0:
-        raise ValueError(f"Invalid vocab size: {vocab_size}")
-    return torch.randint(
-        low=0,
-        high=vocab_size,
-        size=(batch_size, seq_len),
-        device=device,
+) -> torch.nn.Module:
+    model.to(device)
+    model = train_spec.parallelize_fn(model, parallel_dims, job_config)
+    model.train()
+    return model
+
+
+def build_dataloader(
+    job_config: JobConfig,
+    train_spec: TrainSpec,
+    parallel_dims: ParallelDims,
+):
+    if "HF_DATASETS_CACHE" not in os.environ:
+        datasets_cache = Path(job_config.job.dump_folder) / "hf_datasets_cache"
+        datasets_cache.mkdir(parents=True, exist_ok=True)
+        os.environ["HF_DATASETS_CACHE"] = str(datasets_cache)
+        datasets_config.HF_DATASETS_CACHE = str(datasets_cache)
+
+    tokenizer = (
+        train_spec.build_tokenizer_fn(job_config)
+        if train_spec.build_tokenizer_fn is not None
+        else None
     )
+    if tokenizer is None:
+        raise RuntimeError(
+            f"{job_config.model.name!r} does not provide a tokenizer for dataset-backed debug runs."
+        )
+
+    if parallel_dims.dp_enabled:
+        dp_mesh = parallel_dims.world_mesh["dp"]
+        dp_world_size = dp_mesh.size()
+        dp_rank = dp_mesh.get_local_rank()
+    else:
+        dp_world_size = 1
+        dp_rank = 0
+
+    dataloader = train_spec.build_dataloader_fn(
+        dp_world_size=dp_world_size,
+        dp_rank=dp_rank,
+        tokenizer=tokenizer,
+        job_config=job_config,
+    )
+    return dataloader
 
 
-def cross_entropy_lm_loss(logits: torch.Tensor, tokens: torch.Tensor) -> torch.Tensor:
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = tokens[:, 1:].contiguous()
+def get_next_batch(
+    data_iterator,
+    device: torch.device,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    try:
+        input_dict, labels = next(data_iterator)
+    except StopIteration as ex:
+        raise DataloaderExhaustedError() from ex
+
+    for key, value in input_dict.items():
+        if isinstance(value, torch.Tensor):
+            input_dict[key] = value.to(device)
+    labels = labels.to(device)
+    return input_dict, labels
+
+
+def cross_entropy_lm_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
     )
 
 
@@ -268,6 +335,207 @@ def log_post_warmup_summary(perf_stats: PerfStats, warmup_steps: int) -> None:
     )
 
 
+def get_seed_checkpoint_dir(
+    job_config: JobConfig,
+    path_override: str | None = None,
+) -> Path:
+    if path_override:
+        return Path(path_override)
+    return (
+        Path(job_config.job.dump_folder)
+        / job_config.checkpoint.folder
+        / "step-0"
+    )
+
+
+def get_seed_checkpoint_file(checkpoint_dir: Path) -> Path:
+    return checkpoint_dir / SEED_CHECKPOINT_FILENAME
+
+
+def get_seed_checkpoint_metadata_file(checkpoint_dir: Path) -> Path:
+    return checkpoint_dir / SEED_CHECKPOINT_METADATA_FILENAME
+
+
+def clone_state_dict_to_cpu(
+    state_dict: dict[str, torch.Tensor],
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    return {
+        key: value.detach().cpu().to(dtype).clone()
+        for key, value in state_dict.items()
+    }
+
+
+def build_native_seed_adapter(
+    model_args: BaseModelArgs,
+    job_config: JobConfig,
+) -> Llama3StateDictAdapter | Qwen3StateDictAdapter:
+    if job_config.model.name == "llama3":
+        return Llama3StateDictAdapter(model_args, job_config.model.hf_assets_path)
+    if job_config.model.name == "qwen3":
+        return Qwen3StateDictAdapter(model_args, job_config.model.hf_assets_path)
+    raise NotImplementedError(
+        f"Shared seed checkpoint adapter is not implemented for {job_config.model.name!r}."
+    )
+
+
+def export_seed_state_dict(
+    model: torch.nn.Module,
+    model_args: BaseModelArgs,
+    job_config: JobConfig,
+) -> dict[str, torch.Tensor]:
+    export_dtype = TORCH_DTYPE_MAP[job_config.checkpoint.export_dtype]
+    state_dict = clone_state_dict_to_cpu(model.state_dict(), export_dtype)
+
+    if job_config.model.name in {"llama3", "qwen3"}:
+        adapter = build_native_seed_adapter(model_args, job_config)
+        return adapter.to_hf(state_dict)
+
+    if job_config.model.name == "transformers_modeling_backend":
+        normalized_state_dict = {}
+        for key, value in state_dict.items():
+            normalized_key = key.removeprefix("model.")
+            if (
+                normalized_key == "lm_head.weight"
+                and getattr(model_args, "tie_word_embeddings", False)
+            ):
+                continue
+            normalized_state_dict[normalized_key] = value
+        return normalized_state_dict
+
+    raise NotImplementedError(
+        f"Shared seed checkpoint export is not implemented for {job_config.model.name!r}."
+    )
+
+
+def save_seed_checkpoint(
+    model: torch.nn.Module,
+    model_args: BaseModelArgs,
+    job_config: JobConfig,
+) -> Path:
+    checkpoint_dir = get_seed_checkpoint_dir(job_config)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    torch.save(
+        export_seed_state_dict(model, model_args, job_config),
+        get_seed_checkpoint_file(checkpoint_dir),
+    )
+
+    metadata = {
+        "format": "hf_compatible_state_dict",
+        "model_name": job_config.model.name,
+        "flavor": job_config.model.flavor,
+    }
+    get_seed_checkpoint_metadata_file(checkpoint_dir).write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return checkpoint_dir
+
+
+def load_seed_checkpoint(path: str) -> dict[str, torch.Tensor]:
+    checkpoint_dir = Path(path)
+    checkpoint_file = get_seed_checkpoint_file(checkpoint_dir)
+    if not checkpoint_file.is_file():
+        raise FileNotFoundError(
+            f"Shared seed checkpoint file not found at {checkpoint_file}."
+        )
+    return torch.load(checkpoint_file, map_location="cpu", weights_only=True)
+
+
+def validate_loaded_state_dict(
+    incompatible_keys: torch.nn.modules.module._IncompatibleKeys,
+    allowed_missing_suffixes: tuple[str, ...] = (),
+) -> None:
+    missing_keys = [
+        key
+        for key in incompatible_keys.missing_keys
+        if not any(key.endswith(suffix) for suffix in allowed_missing_suffixes)
+    ]
+    unexpected_keys = list(incompatible_keys.unexpected_keys)
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(
+            "Seed checkpoint load mismatch: "
+            f"missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
+        )
+
+
+def load_seed_checkpoint_into_model(
+    model: torch.nn.Module,
+    model_args: BaseModelArgs,
+    job_config: JobConfig,
+) -> None:
+    if not job_config.checkpoint.initial_load_path:
+        return
+
+    shared_seed_state_dict = load_seed_checkpoint(
+        job_config.checkpoint.initial_load_path
+    )
+
+    if job_config.model.name in {"llama3", "qwen3"}:
+        adapter = build_native_seed_adapter(model_args, job_config)
+        incompatible_keys = model.load_state_dict(
+            adapter.from_hf(shared_seed_state_dict),
+            strict=False,
+        )
+        validate_loaded_state_dict(incompatible_keys)
+    elif job_config.model.name == "transformers_modeling_backend":
+        wrapped_state_dict = {
+            f"model.{key}": value for key, value in shared_seed_state_dict.items()
+        }
+        incompatible_keys = model.load_state_dict(
+            wrapped_state_dict,
+            strict=False,
+        )
+        allowed_missing_suffixes = HF_ALLOWED_MISSING_KEY_SUFFIXES
+        if getattr(model_args, "tie_word_embeddings", False):
+            allowed_missing_suffixes += HF_TIED_WEIGHT_ALLOWED_MISSING_KEY_SUFFIXES
+        validate_loaded_state_dict(
+            incompatible_keys,
+            allowed_missing_suffixes=allowed_missing_suffixes,
+        )
+    else:
+        raise NotImplementedError(
+            f"Shared seed checkpoint load is not implemented for {job_config.model.name!r}."
+        )
+
+    rank_zero_log(
+        f"Loaded shared seed checkpoint from {job_config.checkpoint.initial_load_path}"
+    )
+
+
+def initialize_full_model(
+    model: torch.nn.Module,
+    job_config: JobConfig,
+) -> None:
+    init_weights = getattr(model, "init_weights", None)
+    if init_weights is None or job_config.model.name == "transformers_modeling_backend":
+        return
+    with torch.no_grad():
+        init_weights()
+
+
+def create_seed_checkpoint(
+    job_config: JobConfig,
+    train_spec: TrainSpec,
+) -> None:
+    dist_utils.set_determinism(
+        world_mesh=None,
+        device=torch.device("cpu"),
+        debug_config=job_config.debug,
+        distinct_seed_mesh_dims=[],
+    )
+
+    model, model_args = build_model(
+        job_config,
+        train_spec,
+        use_meta_init=False,
+    )
+    initialize_full_model(model, job_config)
+    checkpoint_dir = save_seed_checkpoint(model, model_args, job_config)
+    logger.info("Saved shared seed checkpoint to %s", checkpoint_dir)
+
+
 @record
 def main() -> None:
     init_logger()
@@ -276,15 +544,39 @@ def main() -> None:
 
     train_spec = get_train_spec(job_config.model.name)
 
+    if job_config.checkpoint.enable and job_config.checkpoint.create_seed_checkpoint:
+        create_seed_checkpoint(job_config, train_spec)
+        return
+
     device, parallel_dims = init_distributed(job_config)
     try:
-        model, model_args = build_model(job_config, train_spec)
+        load_shared_seed = bool(
+            job_config.checkpoint.enable
+            and job_config.checkpoint.initial_load_path
+        )
+        model, model_args = build_model(
+            job_config,
+            train_spec,
+            use_meta_init=not load_shared_seed,
+        )
         seq_len = job_config.training.seq_len
         _, num_flops_per_token = model_args.get_nparams_and_flops(model, seq_len)
-        model = parallelize_and_materialize(
-            model, train_spec, job_config, parallel_dims, device
-        )
+        if load_shared_seed:
+            load_seed_checkpoint_into_model(model, model_args, job_config)
+            model = move_and_parallelize_loaded_model(
+                model,
+                train_spec,
+                job_config,
+                parallel_dims,
+                device,
+            )
+        else:
+            model = parallelize_and_materialize(
+                model, train_spec, job_config, parallel_dims, device
+            )
         perf_stats = init_perf_stats(device, num_flops_per_token, job_config)
+        dataloader = build_dataloader(job_config, train_spec, parallel_dims)
+        data_iterator = iter(dataloader)
 
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -298,8 +590,6 @@ def main() -> None:
         max_norm = job_config.training.max_norm
         warmup_steps = job_config.lr_scheduler.warmup_steps
         log_freq = job_config.metrics.log_freq
-        vocab_size = model_args.vocab_size
-        tokens_per_step = batch_size * seq_len * world_size
         rank_zero_log(
             "Trainer is initialized with "
             f"local batch size {batch_size}, "
@@ -314,15 +604,10 @@ def main() -> None:
         for step in range(1, steps + 1):
             optimizer.zero_grad(set_to_none=True)
 
-            tokens = make_synthetic_batch(
-                batch_size=batch_size,
-                seq_len=seq_len,
-                vocab_size=vocab_size,
-                device=device,
-            )
-
-            logits = model(tokens)
-            loss = cross_entropy_lm_loss(logits, tokens)
+            input_dict, labels = get_next_batch(data_iterator, device)
+            inputs = input_dict["input"]
+            logits = model(inputs)
+            loss = cross_entropy_lm_loss(logits, labels)
             loss.backward()
 
             grad_norm = dist_utils.clip_grad_norm_(
@@ -334,7 +619,7 @@ def main() -> None:
 
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
-            perf_stats.ntokens_since_last_log += tokens_per_step
+            perf_stats.ntokens_since_last_log += labels.numel()
 
             if step % log_freq == 0 or step == 1 or step == steps:
                 avg_loss = get_global_mean(loss, parallel_dims)

@@ -180,7 +180,7 @@ class HFTransformerModelArgs(PretrainedConfig, BaseModelArgs):
         self.use_cache = False
         self.initializer_range = 1.0  # use as std for normal init in embedding
 
-        if not hasattr(self, "inter_dim"):  # Only for llama model
+        if getattr(self, "intermediate_size", None) is None:
             ffn_hidden_size = 4 * self.dim
             ffn_hidden_size = int(2 * ffn_hidden_size / 3)
             if self.ffn_dim_multiplier is not None:
@@ -189,7 +189,8 @@ class HFTransformerModelArgs(PretrainedConfig, BaseModelArgs):
                 (ffn_hidden_size + self.multiple_of - 1) // self.multiple_of
             )
 
-        self.head_dim = self.dim // self.num_attention_heads
+        if getattr(self, "head_dim", None) is None:
+            self.head_dim = self.dim // self.num_attention_heads
 
         return self
 

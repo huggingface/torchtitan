@@ -31,6 +31,38 @@ flavors = {
             n_kv_heads=16,
         ),
     ),
+    "matched_debugmodel": HFTransformerModelArgs(
+        titan_dense_args=TitanDenseModelArgs(
+            dim=256,
+            n_layers=6,
+            n_heads=16,
+            n_kv_heads=16,
+            vocab_size=2048,
+            rope_theta=500000,
+        ),
+    ),
+    "matched_qwen3_debugmodel": HFTransformerModelArgs(
+        titan_dense_args=TitanDenseModelArgs(
+            dim=256,
+            n_layers=8,
+            n_heads=16,
+            n_kv_heads=8,
+            vocab_size=2048,
+            norm_eps=1e-6,
+            rope_theta=1000000,
+        ),
+    ),
+    "matched_qwen3_debugmodel_untied": HFTransformerModelArgs(
+        titan_dense_args=TitanDenseModelArgs(
+            dim=256,
+            n_layers=8,
+            n_heads=16,
+            n_kv_heads=8,
+            vocab_size=2048,
+            norm_eps=1e-6,
+            rope_theta=1000000,
+        ),
+    ),
     "full": HFTransformerModelArgs(
         titan_dense_args=TitanDenseModelArgs(),
     ),

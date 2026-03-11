@@ -149,7 +149,7 @@ class HFTransformerModel(nn.Module):
             if hasattr(self, "mlp") and self.mlp is not None:
                 self.mlp.layer_idx = layer_idx
 
-        def _initialize_weights_patched(self, module):
+        def _initialize_weights_patched(self, module, *args, **kwargs):
             # NOTE(3outeille): monkey-patch PreTrainedModel to handle meta device initialization correctly
             # The default _initialize_weights sets _is_hf_initialized = True even on a meta device,
             # which prevents subsequent proper initialization.

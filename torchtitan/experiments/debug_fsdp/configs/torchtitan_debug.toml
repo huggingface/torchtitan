@@ -2,7 +2,7 @@
 
 [job]
 dump_folder = "./outputs"
-description = "Minimal FSDP debug (torchtitan backend)"
+description = "Minimal FSDP debug (TorchTitan Qwen3 backend)"
 print_config = true
 
 [metrics]
@@ -10,9 +10,9 @@ log_freq = 1
 disable_color_printing = false
 
 [model]
-name = "llama3"
-flavor = "debugmodel"
-hf_assets_path = "./tests/assets/tokenizer"
+name = "qwen3"
+flavor = "debugmodel_untied"
+hf_assets_path = "../../../tests/assets/tokenizer"
 
 [optimizer]
 name = "AdamW"
@@ -28,6 +28,7 @@ seq_len = 512
 max_norm = 1.0
 steps = 10
 dataset = "c4_test"
+dataset_path = "../../../tests/assets/c4_test"
 
 [parallelism]
 data_parallel_replicate_degree = 1
@@ -44,4 +45,4 @@ enable = false
 
 [debug]
 seed = 2026
-deterministic = false
+deterministic = true
