@@ -19,6 +19,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from datetime import timedelta
@@ -40,6 +41,8 @@ from torchtitan.protocols.train_spec import BaseModelArgs, get_train_spec, Train
 from torchtitan.tools import utils as titan_utils
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.utils import device_module, device_type, set_default_dtype
+
+USE_HF_FSDP = os.environ.get("USE_HF_FSDP", "0") == "1"
 
 
 SEED_CHECKPOINT_FILENAME = "seed_model.pt"
@@ -95,6 +98,98 @@ def build_model(
             model = train_spec.model_cls(model_args)
 
     return model, model_args
+
+
+def _prepare_hf_fsdp_model_dir(job_config: JobConfig) -> Path:
+    """Prepare a HF-format model directory with seed checkpoint weights.
+
+    Copies config.json from the HF model config path and converts the seed
+    checkpoint (.pt with HF-compatible keys) into safetensors so that
+    ``from_pretrained`` can load everything in one shot.
+    """
+    import shutil
+
+    from safetensors.torch import save_file
+
+    hf_config_dir = Path(job_config.hf_transformers.model)
+    seed_checkpoint_path = job_config.checkpoint.initial_load_path
+
+    # Build the output directory next to the seed checkpoint
+    out_dir = Path(job_config.job.dump_folder) / "hf_fsdp_pretrained"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy config.json
+    shutil.copy2(hf_config_dir / "config.json", out_dir / "config.json")
+
+    if seed_checkpoint_path:
+        seed_state_dict = load_seed_checkpoint(seed_checkpoint_path)
+        save_file(seed_state_dict, out_dir / "model.safetensors")
+        rank_zero_log(
+            f"Prepared HF model dir at {out_dir} with seed weights from {seed_checkpoint_path}"
+        )
+    else:
+        rank_zero_log(
+            f"Prepared HF model dir at {out_dir} (random init, no seed checkpoint)"
+        )
+
+    return out_dir
+
+
+def build_hf_fsdp_model(
+    job_config: JobConfig,
+    device: torch.device,
+    world_size: int,
+) -> tuple[torch.nn.Module, int]:
+    """Build model using HF Transformers from_pretrained with fsdp_plan='auto'.
+
+    This bypasses torchtitan's parallelization and uses the FSDP2 integration
+    built into transformers-v5.
+    """
+    # Add transformers-v5-fsdp to the path so we use the right version
+    v5_fsdp_path = str(Path(__file__).resolve().parents[3] / "transformers-v5-fsdp" / "src")
+    if v5_fsdp_path not in sys.path:
+        sys.path.insert(0, v5_fsdp_path)
+
+    from transformers import AutoModelForCausalLM
+
+    # Only rank 0 prepares the directory to avoid races
+    if dist.get_rank() == 0:
+        model_dir = _prepare_hf_fsdp_model_dir(job_config)
+    dist.barrier()
+    # All ranks resolve the same path
+    model_dir = Path(job_config.job.dump_folder) / "hf_fsdp_pretrained"
+
+    train_dtype = TORCH_DTYPE_MAP[job_config.training.dtype]
+
+    fsdp_mesh = torch.distributed.init_device_mesh(
+        device.type, (world_size,), mesh_dim_names=("dp_shard",)
+    )
+
+    rank_zero_log(
+        f"Building HF FSDP model from {model_dir} with fsdp_plan='auto' "
+        f"(cpu_offload=False, mixed_precision=False)"
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        str(model_dir),
+        fsdp_plan={"mode": "auto", "cpu_offload": False, "mixed_precision": False},
+        device_mesh=fsdp_mesh,
+        torch_dtype=train_dtype,
+    )
+
+    # Count parameters and estimate FLOPs
+    num_params = sum(p.numel() for p in model.parameters())
+    seq_len = job_config.training.seq_len
+    # Rough FLOPs estimate: 6 * num_params (forward + backward) per token
+    num_flops_per_token = 6 * num_params
+
+    rank_zero_log(
+        f"HF FSDP model loaded: {num_params:,} params, "
+        f"estimated {num_flops_per_token:,} flops/token"
+    )
+
+    model.train()
+    return model, num_flops_per_token
 
 
 def init_distributed(job_config: JobConfig) -> tuple[torch.device, ParallelDims]:
@@ -550,30 +645,39 @@ def main() -> None:
 
     device, parallel_dims = init_distributed(job_config)
     try:
-        load_shared_seed = bool(
-            job_config.checkpoint.enable
-            and job_config.checkpoint.initial_load_path
-        )
-        model, model_args = build_model(
-            job_config,
-            train_spec,
-            use_meta_init=not load_shared_seed,
-        )
+        world_size = dist.get_world_size()
         seq_len = job_config.training.seq_len
-        _, num_flops_per_token = model_args.get_nparams_and_flops(model, seq_len)
-        if load_shared_seed:
-            load_seed_checkpoint_into_model(model, model_args, job_config)
-            model = move_and_parallelize_loaded_model(
-                model,
-                train_spec,
-                job_config,
-                parallel_dims,
-                device,
+
+        if USE_HF_FSDP:
+            rank_zero_log("Using HF Transformers from_pretrained with fsdp_plan='auto'")
+            model, num_flops_per_token = build_hf_fsdp_model(
+                job_config, device, world_size
             )
         else:
-            model = parallelize_and_materialize(
-                model, train_spec, job_config, parallel_dims, device
+            load_shared_seed = bool(
+                job_config.checkpoint.enable
+                and job_config.checkpoint.initial_load_path
             )
+            model, model_args = build_model(
+                job_config,
+                train_spec,
+                use_meta_init=not load_shared_seed,
+            )
+            _, num_flops_per_token = model_args.get_nparams_and_flops(model, seq_len)
+            if load_shared_seed:
+                load_seed_checkpoint_into_model(model, model_args, job_config)
+                model = move_and_parallelize_loaded_model(
+                    model,
+                    train_spec,
+                    job_config,
+                    parallel_dims,
+                    device,
+                )
+            else:
+                model = parallelize_and_materialize(
+                    model, train_spec, job_config, parallel_dims, device
+                )
+
         perf_stats = init_perf_stats(device, num_flops_per_token, job_config)
         dataloader = build_dataloader(job_config, train_spec, parallel_dims)
         data_iterator = iter(dataloader)
@@ -584,7 +688,6 @@ def main() -> None:
             weight_decay=job_config.optimizer.weight_decay,
         )
 
-        world_size = dist.get_world_size()
         batch_size = job_config.training.local_batch_size
         steps = job_config.training.steps
         max_norm = job_config.training.max_norm
@@ -605,8 +708,15 @@ def main() -> None:
             optimizer.zero_grad(set_to_none=True)
 
             input_dict, labels = get_next_batch(data_iterator, device)
-            inputs = input_dict["input"]
-            logits = model(inputs)
+
+            if USE_HF_FSDP:
+                inputs = input_dict["input"]
+                outputs = model(input_ids=inputs)
+                logits = outputs.logits
+            else:
+                inputs = input_dict["input"]
+                logits = model(inputs)
+
             loss = cross_entropy_lm_loss(logits, labels)
             loss.backward()
 

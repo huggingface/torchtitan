@@ -34,4 +34,21 @@ torchrun --nproc_per_node=2 minimal_fsdp.py \
   --checkpoint.initial_load_path "${seed_checkpoint_path}" \
   --checkpoint.load_only
 
-git diff --no-index --color --word-diff=color outputs/torchtitan_log.txt outputs/hf_backend_log.txt 2>&1 | tee outputs/diff.txt
+echo "=== Running HF Transformers from_pretrained FSDP ==="
+USE_HF_FSDP=1 \
+TORCHTITAN_LOG_FILE="${log_dir}/hf_fsdp_log.txt" \
+torchrun --nproc_per_node=2 minimal_fsdp.py \
+  --job.config_file configs/hf_backend_debug.toml \
+  --checkpoint.enable \
+  --checkpoint.initial_load_path "${seed_checkpoint_path}" \
+  --checkpoint.load_only
+
+echo "=== Diff: HF backend (torchtitan FSDP) vs Native TorchTitan ==="
+git diff --no-index --color --word-diff=color \
+  outputs/torchtitan_log.txt outputs/hf_backend_log.txt > outputs/diff_hf_backend_vs_torchtitan.txt 2>&1 || true
+cat outputs/diff_hf_backend_vs_torchtitan.txt
+
+echo "=== Diff: HF from_pretrained FSDP vs Native TorchTitan ==="
+git diff --no-index --color --word-diff=color \
+  outputs/torchtitan_log.txt outputs/hf_fsdp_log.txt > outputs/diff_hf_fsdp_vs_torchtitan.txt 2>&1 || true
+cat outputs/diff_hf_fsdp_vs_torchtitan.txt
