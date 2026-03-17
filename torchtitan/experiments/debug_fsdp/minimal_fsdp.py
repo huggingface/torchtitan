@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
@@ -34,7 +35,8 @@ from torchtitan.components.metrics import DeviceMemoryMonitor
 from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.models.llama3.model.state_dict_adapter import Llama3StateDictAdapter
-from torchtitan.models.llama4.infra.parallelize import apply_fsdp
+from torchtitan.models.llama3.infra.parallelize import apply_fsdp as llama3_apply_fsdp
+from torchtitan.models.llama4.infra.parallelize import apply_fsdp as llama4_apply_fsdp
 from torchtitan.models.qwen3.model.state_dict_adapter import Qwen3StateDictAdapter
 from torchtitan.protocols.train_spec import get_train_spec, TrainSpec
 from torchtitan.tools import utils as titan_utils
@@ -56,6 +58,50 @@ HF_TIED_WEIGHT_ALLOWED_MISSING_KEY_SUFFIXES = ("lm_head.weight",)
 def rank_zero_log(message: str) -> None:
     if not dist.is_initialized() or dist.get_rank() == 0:
         logger.info(message)
+
+
+@dataclass(frozen=True)
+class FSDPDebugOptions:
+    cpu_offload: bool
+    param_dtype: torch.dtype
+    reduce_dtype: torch.dtype
+    param_dtype_name: str
+    reduce_dtype_name: str
+
+    @property
+    def mixed_precision_enabled(self) -> bool:
+        return self.param_dtype != torch.float32 or self.reduce_dtype != torch.float32
+
+
+def resolve_fsdp_debug_options(job_config: JobConfig) -> FSDPDebugOptions:
+    cpu_offload = job_config.training.enable_cpu_offload
+    param_dtype_name = job_config.training.mixed_precision_param
+    reduce_dtype_name = job_config.training.mixed_precision_reduce
+
+    try:
+        param_dtype = TORCH_DTYPE_MAP[param_dtype_name]
+        reduce_dtype = TORCH_DTYPE_MAP[reduce_dtype_name]
+    except KeyError as exc:
+        raise ValueError(
+            "Invalid FSDP dtype override. "
+            f"param={param_dtype_name!r} reduce={reduce_dtype_name!r}"
+        ) from exc
+
+    return FSDPDebugOptions(
+        cpu_offload=cpu_offload,
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+        param_dtype_name=param_dtype_name,
+        reduce_dtype_name=reduce_dtype_name,
+    )
+
+
+def log_fsdp_debug_options(options: FSDPDebugOptions, backend: str) -> None:
+    rank_zero_log(
+        f"{backend} FSDP options: cpu_offload={options.cpu_offload} "
+        f"mixed_precision={options.mixed_precision_enabled} "
+        f"param_dtype={options.param_dtype_name} reduce_dtype={options.reduce_dtype_name}"
+    )
 
 
 
@@ -83,7 +129,7 @@ def init_distributed(job_config: JobConfig) -> tuple[torch.device, ParallelDims]
 
     dist_utils.init_distributed(
         job_config.comm,
-        enable_cpu_backend=False,
+        enable_cpu_backend=job_config.training.enable_cpu_offload,
         base_folder=job_config.job.dump_folder,
     )
 
@@ -217,6 +263,7 @@ def build_and_parallelize_torchtitan(job_config, train_spec, parallel_dims, devi
     load_shared_seed = bool(
         job_config.checkpoint.enable and job_config.checkpoint.initial_load_path
     )
+    fsdp_options = resolve_fsdp_debug_options(job_config)
     model, model_args = build_torchtitan_model(
         job_config, train_spec, use_meta_init=not load_shared_seed
     )
@@ -232,15 +279,22 @@ def build_and_parallelize_torchtitan(job_config, train_spec, parallel_dims, devi
             model.init_weights()
 
     dp_mesh_dim_names = ("dp_shard",)
-    #TODO(3ou): add mixed precision support and cpu_offload support
+    log_fsdp_debug_options(fsdp_options, backend="TorchTitan")
+
+    # Pick the right apply_fsdp based on model type
+    model_name = job_config.model.name
+    if model_name in ("llama3",):
+        apply_fsdp = llama3_apply_fsdp
+    else:
+        apply_fsdp = llama4_apply_fsdp
+
     apply_fsdp(
         model,
         parallel_dims.world_mesh[tuple(dp_mesh_dim_names)],
-        param_dtype=None,
-        reduce_dtype=None,
+        param_dtype=fsdp_options.param_dtype,
+        reduce_dtype=fsdp_options.reduce_dtype,
         pp_enabled=parallel_dims.pp_enabled,
-        # cpu_offload=job_config.training.enable_cpu_offload,
-        cpu_offload=False,
+        cpu_offload=fsdp_options.cpu_offload,
         reshard_after_forward_policy=job_config.parallelism.fsdp_reshard_after_forward,
     )
 
@@ -279,6 +333,7 @@ def build_hf_fsdp_model(job_config, device, world_size):
     if v5_path not in sys.path:
         sys.path.insert(0, v5_path)
     from transformers import AutoModelForCausalLM
+    fsdp_options = resolve_fsdp_debug_options(job_config)
 
     # Rank 0 prepares the directory, others wait
     if dist.get_rank() == 0:
@@ -287,6 +342,7 @@ def build_hf_fsdp_model(job_config, device, world_size):
     model_dir = Path(job_config.job.dump_folder) / "hf_fsdp_pretrained"
 
     rank_zero_log(f"Building HF model from {model_dir}")
+    log_fsdp_debug_options(fsdp_options, backend="HF from_pretrained")
 
     fsdp_mesh = torch.distributed.init_device_mesh(
         device.type, (world_size,), mesh_dim_names=("dp_shard",)
@@ -295,16 +351,28 @@ def build_hf_fsdp_model(job_config, device, world_size):
         str(model_dir),
         torch_dtype=torch.float32,
         device_map=device,
-        fsdp_plan={"mode": "auto", "cpu_offload": False, "mixed_precision": False},
+        fsdp_plan={
+            "mode": "auto",
+            "cpu_offload": fsdp_options.cpu_offload,
+            "mixed_precision": fsdp_options.mixed_precision_enabled,
+            "mixed_precision_param_dtype": fsdp_options.param_dtype,
+            "mixed_precision_reduce_dtype": fsdp_options.reduce_dtype,
+        },
         fsdp_device_mesh=fsdp_mesh,
     )
 
-    # Param count (local shard × world_size for full count)
-    local_params = sum(p.numel() for p in model.parameters())
-    num_params = local_params * world_size
+    if job_config.checkpoint.initial_load_path:
+        num_params = sum(
+            value.numel() for value in load_seed_checkpoint(job_config.checkpoint.initial_load_path).values()
+        )
+        param_count_source = "seed checkpoint"
+    else:
+        num_params = sum(p.numel() for p in model.parameters())
+        param_count_source = "model.parameters()"
+
     num_flops_per_token = 6 * num_params
     rank_zero_log(
-        f"HF model: {num_params:,} params ({local_params:,} local/rank), "
+        f"HF model: {num_params:,} params ({param_count_source}), "
         f"{num_flops_per_token:,} flops/token"
     )
 

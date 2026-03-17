@@ -33,6 +33,8 @@ max_norm = 1.0
 steps = 10
 dataset = "c4_test"
 dataset_path = "../../../tests/assets/c4_test"
+mixed_precision_param = "float32"
+mixed_precision_reduce = "float32"
 
 [parallelism]
 data_parallel_replicate_degree = 1

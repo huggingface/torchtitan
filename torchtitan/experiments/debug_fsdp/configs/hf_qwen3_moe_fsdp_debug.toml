@@ -1,9 +1,10 @@
-# Minimal FSDP debug config — TorchTitan backend
+# Minimal FSDP debug config - HF from_pretrained Qwen3 MoE
 
 [job]
 dump_folder = "./outputs"
-description = "Minimal FSDP debug (TorchTitan Qwen3 backend)"
+description = "Minimal FSDP debug (HF from_pretrained Qwen3 MoE backend)"
 print_config = true
+custom_config_module = "torchtitan.experiments.transformers_modeling_backend.job_config"
 
 [metrics]
 log_freq = 1
@@ -11,8 +12,11 @@ disable_color_printing = false
 
 [model]
 name = "qwen3"
-flavor = "debugmodel_untied"
+flavor = "debugmodel_moe"
 hf_assets_path = "../../../tests/assets/tokenizer"
+
+[hf_transformers]
+model = "./configs/hf_qwen3_tiny_moe"
 
 [optimizer]
 name = "AdamW"
