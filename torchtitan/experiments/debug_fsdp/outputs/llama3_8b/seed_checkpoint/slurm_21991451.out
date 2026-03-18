@@ -1,0 +1,12 @@
+========================
+START TIME: Tue Mar 17 10:37:28 UTC 2026
+python3 version = Python 3.12.9
+===========
+Running job: llama3_8b_seed
+Config file: /fsx/ferdinandmom/ferdinand-hf/huggingface/torchtitan/torchtitan/experiments/debug_fsdp/configs/torchtitan_llama3_8b.toml
+Running command: python minimal_fsdp.py     --job.config_file /fsx/ferdinandmom/ferdinand-hf/huggingface/torchtitan/torchtitan/experiments/debug_fsdp/configs/torchtitan_llama3_8b.toml     --model.flavor 8B     --job.dump_folder outputs/llama3_8b/seed_checkpoint     --checkpoint.enable     --checkpoint.create_seed_checkpoint
+Job status: RUNNING
+[titan] 2026-03-17 10:37:58,310 - root - INFO - Deterministic algorithm enabled (expect perf degradation).
+[titan] 2026-03-17 10:37:58,389 - root - INFO - Building llama3 8B with TransformerModelArgs(_enforced='This field is used to enforce all fields have defaults.', dim=4096, n_layers=32, n_heads=32, n_kv_heads=8, vocab_size=128256, multiple_of=1024, ffn_dim_multiplier=1.3, norm_eps=1e-05, rope_theta=500000, rope_scaling_args=RoPEScalingArgs(scaling_factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192), max_seq_len=2048, depth_init=True, attn_type='sdpa', attn_mask_type='causal', eos_id=0)
+[titan] 2026-03-17 10:39:10,651 - root - WARNING - model.safetensors.index.json not found at hf_assets_path: ../../../tests/assets/tokenizer/model.safetensors.index.json.                     Defaulting to saving a single safetensors file if checkpoint is saved in HF format
+[titan] 2026-03-17 10:39:32,305 - root - INFO - Saved seed checkpoint to outputs/llama3_8b/seed_checkpoint/checkpoint/step-0

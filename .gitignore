@@ -14,6 +14,7 @@ out
 wandb
 *_results
 debugperf_large
+v4*
 
 torchtitan/datasets/**/*.model
 
