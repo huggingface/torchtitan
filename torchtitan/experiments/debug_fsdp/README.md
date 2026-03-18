@@ -18,6 +18,10 @@ Comparing **TorchTitan native** vs **HF `from_pretrained` + FSDP** (`fsdp_plan="
 - **TorchTitan**: Native `llama3` model with `apply_fsdp` from `torchtitan.models.llama3.infra.parallelize`
 - **HF from_pretrained**: `AutoModelForCausalLM.from_pretrained` with `fsdp_plan={"mode": "auto", ...}` via `transformers-v5-fsdp`
 
+### Results
+
+![](outputs/llama3_8b/metrics.svg)
+
 ---
 
 ## Environment
